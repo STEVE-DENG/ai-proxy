@@ -14,6 +14,8 @@ interface Props {
   onRules: () => void;
   onSettings: () => void;
   busy: boolean;
+  projectName: string;
+  onProject: () => void;
 }
 
 export function TopBar({
@@ -29,6 +31,8 @@ export function TopBar({
   onRules,
   onSettings,
   busy,
+  projectName,
+  onProject,
 }: Props) {
   return (
     <header className="topbar" data-tauri-drag-region>
@@ -56,6 +60,7 @@ export function TopBar({
       </div>
 
       <div className="topbar-actions">
+        <button className="button ghost compact project-trigger" title="切换独立项目空间" onClick={onProject}>{projectName}</button>
         <button className="icon-action" title="规则" onClick={onRules}>
           <SlidersHorizontal size={17} />
         </button>

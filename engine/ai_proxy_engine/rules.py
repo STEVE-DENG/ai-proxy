@@ -137,7 +137,7 @@ def apply_map_local(flow: http.HTTPFlow, rules: list[dict[str, Any]]) -> str | N
     content = file_path.read_bytes()
     content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     flow.response = http.Response.make(
-        200,
+        int(rule.get("responseStatus") or 200),
         content,
         {
             "Content-Type": content_type,

@@ -23,7 +23,7 @@ import {
   X,
 } from "lucide-react";
 import QRCode from "qrcode";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   Batch,
   CaptureStatus,
@@ -38,7 +38,9 @@ import type {
   ThrottleStatus,
 } from "../types";
 import {
+  confirmAction,
   call,
+  clearProjectData,
   deleteSecret,
   enableLocalProxy,
   getSecret,
@@ -59,18 +61,30 @@ interface DialogProps {
 }
 
 export function Dialog({ open, title, kicker, wide, onClose, children }: DialogProps) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!open) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const focusable = () => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex="0"]') || []).filter(element => element.getClientRects().length > 0);
+    focusable()[0]?.focus();
     const listener = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onCloseRef.current(); }
+      if (event.key === "Tab") {
+        const targets = focusable();
+        const first = targets[0], last = targets.at(-1);
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+      }
     };
     window.addEventListener("keydown", listener);
-    return () => window.removeEventListener("keydown", listener);
-  }, [open, onClose]);
+    return () => { window.removeEventListener("keydown", listener); if (previous?.isConnected) previous.focus(); };
+  }, [open]);
   if (!open) return null;
   return (
     <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <section className={`modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true">
+      <section ref={dialogRef} className={`modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
         <header className="modal-head">
           <div>
             {kicker && <span className="eyebrow">{kicker}</span>}
@@ -595,7 +609,8 @@ export function SettingsDialog({
               <div className="settings-heading"><div><span className="eyebrow">LOCAL DATA</span><h3>存储</h3></div></div>
               <div className="settings-card">
                 <div className="settings-card-row"><div><b>数据目录</b><span className="path-line">{storage.dataDir}</span></div><b className="mono">{formatBytes(storage.size)}</b></div>
-                <div className="settings-card-row"><div><b>清理抓包</b><span>删除所有抓包记录与正文，不会删除会话和供应商配置。</span></div><button className="button ghost danger-hover" onClick={async () => { await call("storage.clear-all"); await onRefreshStorage(); setMessage("抓包记录已清理。"); }}><Trash2 size={13} /> 清理</button></div>
+                <div className="settings-card-row"><div><b>清理分析数据</b><span>停止采集与 Agent，删除抓包、会话、文件授权、报告、QA 记录及导入；保留规则、环境和账户配置。</span></div><button className="button ghost danger-hover" onClick={async () => { if (!await confirmAction("确认清理当前项目分析数据？会停止采集和 Agent，已有报告也会删除。")) return; await clearProjectData("analysis"); window.location.reload(); }}><Trash2 size={13} /> 清理</button></div>
+                <div className="settings-card-row"><div><b>重置当前项目</b><span>另删除规则、环境、契约和连接配置。供应商账户与系统钥匙串保留；其他项目不受影响。</span></div><button className="button ghost danger-hover" onClick={async () => { if (!await confirmAction("确认重置当前项目全部业务数据与配置？其他项目和钥匙串不受影响。")) return; await clearProjectData("project"); window.location.reload(); }}>重置项目</button></div>
               </div>
             </>
           )}

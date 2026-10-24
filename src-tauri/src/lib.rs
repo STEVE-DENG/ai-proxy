@@ -285,10 +285,55 @@ async fn engine_call(
 }
 
 #[tauri::command]
+async fn confirm_action(window: tauri::WebviewWindow, message: String) -> bool {
+    rfd::AsyncMessageDialog::new()
+        .set_parent(&window)
+        .set_title("AI Proxy")
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show()
+        .await
+        == rfd::MessageDialogResult::Ok
+}
+
+#[tauri::command]
 fn pick_local_file() -> Option<String> {
     rfd::FileDialog::new()
         .pick_file()
         .map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("读取文件失败: {e}"))
+}
+
+#[tauri::command]
+fn save_text_file(file_name: String, content: String) -> Result<Option<String>, String> {
+    let mut dialog = rfd::FileDialog::new().set_file_name(&file_name);
+    if let Some(extension) = PathBuf::from(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+    {
+        dialog = dialog.add_filter(extension.to_uppercase(), &[extension]);
+    }
+    let Some(path) = dialog.save_file() else {
+        return Ok(None);
+    };
+    std::fs::write(&path, content).map_err(|e| format!("保存文件失败: {e}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn save_bytes_file(file_name: String, content: Vec<u8>) -> Result<Option<String>, String> {
+    if content.len() > 5 * 1024 * 1024 {
+        return Err("正文超过 5 MiB 保存上限".into());
+    }
+    let Some(path) = rfd::FileDialog::new().set_file_name(&file_name).save_file() else {
+        return Ok(None);
+    };
+    std::fs::write(&path, content).map_err(|error| format!("保存文件失败: {error}"))?;
+    Ok(Some(path.to_string_lossy().to_string()))
 }
 
 #[tauri::command]
@@ -549,7 +594,11 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             engine_call,
+            confirm_action,
             pick_local_file,
+            read_text_file,
+            save_text_file,
+            save_bytes_file,
             secret_set,
             secret_get,
             secret_delete,

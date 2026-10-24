@@ -12,7 +12,10 @@ from typing import Any
 
 from pydantic_ai import Agent
 
-from .agent import AgentCoordinator, _build_model
+from .qa import QAService
+from .agent import AgentCoordinator, DEFAULT_BUDGET, _build_model
+from .domain import DomainService
+from .privacy import Redactor
 from .proxy import ProxyManager
 from .store import Store, new_id
 from .throttle import Throttle
@@ -40,6 +43,14 @@ class EngineApp:
                 Path.home() / "Library/Application Support/com.nekoya.ai-proxy",
             )
         )
+        self.project_root = data_dir
+        self.project_root.mkdir(parents=True, exist_ok=True)
+        self.project_manifest = data_dir / "projects.json"
+        self.projects = {"active": "default", "items": [{"id": "default", "name": "默认项目"}]}
+        if self.project_manifest.exists():
+            self.projects = json.loads(self.project_manifest.read_text())
+        active = self.projects.get("active", "default")
+        data_dir = self.project_root if active == "default" else self.project_root / "projects" / active
         self.store = Store(data_dir)
         self.throttle = Throttle()
         self.proxy = ProxyManager(
@@ -49,11 +60,17 @@ class EngineApp:
             data_dir / "certificates",
         )
         self.agent = AgentCoordinator(self.store, self.proxy, self.throttle, emit)
+        self.domain = self.agent.domain
+        self.qa = QAService(self.domain)
         self.emit = emit
         self.closing = asyncio.Event()
+        self.mutation_lock = asyncio.Lock()
+        self.store.mark_interrupted_runs()
+        self.store.recover_inflight_actions()
         self._load_settings()
 
     def _load_settings(self) -> None:
+        self.throttle.update(False, 0, 0, 0)
         throttle_raw = self.store.get_setting("throttle")
         if throttle_raw:
             try:
@@ -66,6 +83,7 @@ class EngineApp:
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
+        self.proxy.addon.decrypt_hosts.clear()
         decrypt_raw = self.store.get_setting("decrypt_hosts", '["*"]')
         try:
             for host in json.loads(decrypt_raw):
@@ -78,29 +96,157 @@ class EngineApp:
         except ValueError:
             self.proxy.port = 8080
 
+    def _current_environment(self) -> dict[str, Any] | None:
+        active_id = self.store.get_setting("active_environment")
+        if not active_id:
+            return None
+        item = next(
+            (config for config in self.store.list_configs("environment") if config["id"] == active_id),
+            None,
+        )
+        return item["config"] | {"id": item["id"], "name": item["config"].get("name") or item["name"]} if item else None
+
+    def _bootstrap(self) -> dict[str, Any]:
+        batches = self.store.list_batches()
+        current = self.store.get_current_batch()
+        sessions = self.store.list_sessions()
+        if not sessions:
+            sessions = [self.store.create_session("开始调试")]
+        current_session = self.store.get_session(sessions[0]["id"])
+        page = self.domain.query(current["id"], {"limit": 500, "sort": "asc"})
+        scenarios = self.store.list_scenarios(current["id"])
+        return {
+            "capture": self.proxy.status(),
+            "throttle": self.throttle.status(),
+            "batches": batches,
+            "currentBatch": current,
+            "requests": page["items"],
+            "requestPage": page,
+            "filterOptions": self.store.filter_options(current["id"]),
+            "rules": self.store.list_rules(),
+            "providers": self.store.list_providers(),
+            "sessions": sessions,
+            "currentSession": current_session,
+            "agent": self.agent.status(),
+            "certificate": self.certificate_info(),
+            "storage": self.store.storage_info(),
+            "listenPort": self.proxy.port,
+            "scenarios": scenarios,
+            "configs": self.store.list_configs(),
+            "activeEnvironment": self._current_environment(),
+            "debugActions": self.store.list_debug_actions(30),
+            "imports": self.store.list_imports(),
+            "mcpServers": self.store.list_mcp_servers(),
+            "configVersion": self.store.config_version(),
+            "projects": self.projects,
+        }
+
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method in ("agent.stop", "agent.approve", "agent.status"):
+            return await self._dispatch(method, params)
+        async with self.mutation_lock:
+            return await self._dispatch(method, params)
+
+    async def _quiesce(self) -> None:
+        self.proxy.set_paused(True)
+        if self.proxy.running:
+            await self.proxy.stop()
+        await self.agent.drain()
+        await asyncio.to_thread(self.proxy.addon.flush_records)
+        self.store.capture_generation += 1
+
+    def _save_projects(self) -> None:
+        temporary = self.project_manifest.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.projects, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(self.project_manifest)
+
+    async def _select_project(self, project_id: str) -> dict[str, Any]:
+        if project_id not in {item["id"] for item in self.projects["items"]}:
+            raise ValueError("项目不存在")
+        if project_id == self.projects["active"]:
+            return self.projects
+        directory = self.project_root if project_id == "default" else self.project_root / "projects" / project_id
+        prepared = Store(directory)
+        prepared.mark_interrupted_runs()
+        prepared.recover_inflight_actions()
+        await self._quiesce()
+        self.proxy.addon.close()
+        self.store = prepared
+        self.throttle = Throttle()
+        self.proxy = ProxyManager(self.store, self.throttle, emit, directory / "certificates")
+        self.agent = AgentCoordinator(self.store, self.proxy, self.throttle, emit)
+        self.domain = self.agent.domain
+        self.qa = QAService(self.domain)
+        self.store.mark_interrupted_runs()
+        self.store.recover_inflight_actions()
+        self._load_settings()
+        self.projects["active"] = project_id
+        self._save_projects()
+        emit("project:changed", self.projects)
+        return self.projects
+
+    async def _dispatch(self, method: str, params: dict[str, Any]) -> Any:
+        if method == "projects.list":
+            return self.projects
+        if method == "projects.create":
+            name = str(params.get("name") or "").strip()
+            if not name:
+                raise ValueError("请输入项目名称")
+            from .store import new_id
+            project = {"id": new_id("project"), "name": name[:100]}
+            self.projects["items"].append(project)
+            self._save_projects()
+            return project
+        if method == "projects.select":
+            return await self._select_project(params["projectId"])
+        if method == "qa.catalog":
+            return self.qa.catalog()
+        if method == "qa.save":
+            return self.qa.save(params["kind"], params["name"], params.get("config") or {}, params.get("id"), params.get("expectedUpdated"))
+        if method == "qa.get":
+            return self.qa.get(params["id"])
+        if method == "qa.checklist":
+            return self.qa.checklist(params.get("requestIds") or [], str(params.get("name") or "人工验证清单"))
+        if method == "qa.baseline":
+            return self.qa.baseline(params["scenarioId"], params["name"], params.get("selector"), params.get("steps"))
+        if method == "qa.compare-baseline":
+            return await asyncio.to_thread(self.qa.compare_baseline, params["baselineId"], params["scenarioId"], params.get("steps"))
+        if method == "qa.recipe-start":
+            return self.qa.recipe_start(params["recipeId"])
+        if method == "qa.recipe-step":
+            return await asyncio.to_thread(self.qa.recipe_step, params["runId"], bool(params.get("execute", False)), params.get("actionId"))
+        if method == "qa.auth":
+            return await asyncio.to_thread(self.qa.auth, params.get("batchId") or self.store.get_current_batch()["id"], params.get("filters") or {})
+        if method == "qa.file-info":
+            return await asyncio.to_thread(self.qa.file_info, params["requestId"], params.get("direction", "response"))
+        if method == "qa.body-export":
+            data = self.store.body_bytes(params["requestId"], params.get("direction", "response"))
+            if data is None:
+                raise ValueError("没有保存的正文")
+            return {"base64": base64.b64encode(data).decode(), "size": len(data), "notice": "导出本地原始正文，可能包含敏感信息"}
+        if method == "qa.package-preview":
+            return await asyncio.to_thread(self.qa.evidence_package, params["reportId"])
+        if method == "qa.package-import":
+            return self.qa.import_package(self._json_param(params))
+        if method == "qa.packages":
+            return self.store.list_configs("evidence_package")
+        if method == "qa.operations":
+            return self.qa.operations(int(params.get("limit", 100)))
+        if method == "qa.matrix-preview":
+            return self.qa.matrix_preview(params["requestId"], params["sessionId"], params["case"], params.get("matrixId"))
+        if method == "qa.matrix-record":
+            return await asyncio.to_thread(self.qa.matrix_record, params["matrixId"], params["actionId"])
+        if method == "qa.matrix-restore":
+            result = self.qa.matrix_restore(params["matrixId"])
+            self.proxy.refresh_rules()
+            emit("config:changed", {"version": self.store.config_version()})
+            return result
+        if method == "qa.stream-settings":
+            self.store.set_setting("capture_stream_events", json.dumps(bool(params.get("sse"))))
+            self.store.set_setting("capture_websocket_frames", json.dumps(bool(params.get("websocket"))))
+            return self.qa.catalog()
         if method == "app.bootstrap":
-            batches = self.store.list_batches()
-            current = self.store.get_current_batch()
-            sessions = self.store.list_sessions()
-            if not sessions:
-                sessions = [self.store.create_session("开始调试")]
-            current_session = self.store.get_session(sessions[0]["id"])
-            return {
-                "capture": self.proxy.status(),
-                "throttle": self.throttle.status(),
-                "batches": batches,
-                "currentBatch": current,
-                "requests": self.store.list_requests(current["id"]),
-                "rules": self.store.list_rules(),
-                "providers": self.store.list_providers(),
-                "sessions": sessions,
-                "currentSession": current_session,
-                "agent": self.agent.status(),
-                "certificate": self.certificate_info(),
-                "storage": self.store.storage_info(),
-                "listenPort": self.proxy.port,
-            }
+            return self._bootstrap()
 
         if method == "capture.status":
             return self.proxy.status()
@@ -115,32 +261,125 @@ class EngineApp:
         if method == "capture.set-lan":
             return await self.proxy.set_lan(bool(params.get("lan", False)))
 
-        if method == "requests.list":
+        if method in ("requests.list", "requests.query"):
             batch_id = params.get("batchId") or self.store.get_current_batch()["id"]
-            return self.store.list_requests(
-                batch_id,
-                str(params.get("query", "")),
-                str(params.get("method", "")),
-                str(params.get("status", "")),
-                str(params.get("sourceIp", "")),
+            filters = dict(params)
+            filters.setdefault("limit", 100)
+            result = await asyncio.to_thread(self.domain.query, batch_id, filters)
+            if method == "requests.list":
+                return list(reversed(result["items"]))
+            return result
+        if method == "requests.tree":
+            return await asyncio.to_thread(
+                self.domain.tree,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params.get("filters") or {},
+                params.get("parent") or {"type": "root"},
                 int(params.get("limit", 500)),
             )
         if method == "requests.detail":
-            detail = self.store.request_detail(params["requestId"])
-            return self._with_body_preview(detail)
+            return await asyncio.to_thread(self._request_detail, params["requestId"])
+        if method == "requests.content":
+            return await asyncio.to_thread(
+                self.domain.read_content,
+                params["requestId"],
+                direction=str(params.get("direction", "response")),
+                header_name=str(params.get("headerName", "")),
+                query_key=str(params.get("queryKey", "")),
+                pointer=str(params.get("jsonPointer", "")),
+                offset=int(params.get("offset", 0)),
+                limit=int(params.get("limit", 12000)),
+                raw_preview=bool(params.get("rawPreview", False)),
+                local_raw=bool(params.get("localRaw", False)),
+                kind=str(params.get("kind", "body")),
+                form_key=str(params.get("formKey", "")),
+            )
+        if method == "requests.aggregate":
+            return await asyncio.to_thread(
+                self.domain.aggregate,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params,
+                str(params.get("groupBy", "endpoint")),
+            )
+        if method == "requests.compare":
+            return await asyncio.to_thread(
+                self.domain.compare, params["requestIdA"], params["requestIdB"]
+            )
+        if method == "requests.relations":
+            return await asyncio.to_thread(
+                self.domain.relations,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params,
+            )
+        if method == "requests.trace-groups":
+            return await asyncio.to_thread(
+                self.domain.trace_groups,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params,
+            )
+        if method == "requests.waterfall":
+            return await asyncio.to_thread(self.domain.waterfall, params["traceId"])
+        if method == "requests.duplicates":
+            return await asyncio.to_thread(
+                self.domain.duplicate_patterns,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params,
+            )
+        if method == "requests.filter-options":
+            return self.store.filter_options(
+                params.get("batchId") or self.store.get_current_batch()["id"]
+            )
+        if method == "requests.versions":
+            return self.store.request_versions(params.get("ids") or [])
+        if method == "requests.add-relation":
+            request_a = self.store.request_summary(params["sourceId"])
+            return self.store.add_relation(
+                request_a["batchId"],
+                params["sourceId"],
+                params["targetId"],
+                str(params.get("type", "manual-scenario")),
+                params.get("basis") or {},
+                manual=True,
+            )
+
+        if method == "scope.create":
+            scope = await asyncio.to_thread(
+                self.domain.build_scope,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params.get("filters") or {},
+                params.get("selectedIds"),
+                params.get("scenarioId"),
+                str(params.get("mode", "snapshot")),
+            )
+            return scope
+
         if method == "batches.list":
             return self.store.list_batches()
         if method == "batches.create":
-            return self.store.create_batch(params.get("label"))
+            return self.store.create_batch(params.get("label"), params.get("metadata"))
         if method == "batches.select":
             batch = self.store.select_batch(params["batchId"])
-            return {"batch": batch, "requests": self.store.list_requests(batch["id"])}
+            page = await asyncio.to_thread(
+                self.domain.query, batch["id"], {"limit": 500, "sort": "asc"}
+            )
+            return {
+                "batch": batch,
+                "requests": page["items"],
+                "requestPage": page,
+                "scenarios": self.store.list_scenarios(batch["id"]),
+                "filterOptions": self.store.filter_options(batch["id"]),
+            }
         if method == "batches.clear":
-            self.store.clear_batch(params["batchId"])
+            await self._quiesce()
+            self.store.clear_batch(
+                params["batchId"],
+                delete_reports=bool(params.get("deleteReports", False)),
+            )
             return {"ok": True}
         if method == "batches.delete":
-            self.store.delete_batch(params["batchId"])
-            return {"ok": True, "currentBatch": self.store.get_current_batch()}
+            await self._quiesce()
+            result = self.store.delete_batch(params["batchId"])
+            return {"ok": True, "currentBatch": self.store.get_current_batch(), "result": result}
 
         if method == "rules.list":
             return self.store.list_rules()
@@ -148,16 +387,19 @@ class EngineApp:
             rule = self.store.save_rule(params)
             self.proxy.refresh_rules()
             emit("rules:changed", self.store.list_rules())
+            emit("config:changed", {"version": self.store.config_version()})
             return rule
         if method == "rules.delete":
             self.store.delete_rule(params["ruleId"])
             self.proxy.refresh_rules()
             emit("rules:changed", self.store.list_rules())
+            emit("config:changed", {"version": self.store.config_version()})
             return {"ok": True}
         if method == "rules.reorder":
             self.store.reorder_rules(params.get("ids", []))
             self.proxy.refresh_rules()
             emit("rules:changed", self.store.list_rules())
+            emit("config:changed", {"version": self.store.config_version()})
             return {"ok": True}
 
         if method == "throttle.get":
@@ -170,8 +412,10 @@ class EngineApp:
                 int(params.get("latencyMs", 0)),
             )
             self.store.set_setting("throttle", json.dumps(result))
+            self.store.bump_config_version()
             emit("proxy:throttle", result)
             emit("capture:status", self.proxy.status())
+            emit("config:changed", {"version": self.store.config_version()})
             return result
 
         if method == "decrypt.list":
@@ -200,7 +444,6 @@ class EngineApp:
             return self.store.create_session(params.get("title", "新会话"))
         if method == "sessions.delete":
             self.store.delete_session(params["sessionId"])
-            self.agent.histories.pop(params["sessionId"], None)
             return {"ok": True}
         if method == "sessions.add-file":
             result = self.store.add_session_file(params["sessionId"], params["path"])
@@ -226,10 +469,25 @@ class EngineApp:
                 raise ValueError("供应商不存在")
             model = _build_model(provider, str(params.get("apiKey", "")))
             agent = Agent(model, instructions="Reply with exactly OK, no other text.")
-            result = await asyncio.wait_for(agent.run("Connection test. Reply with OK."), timeout=45)
+            result = await asyncio.wait_for(
+                agent.run("Connection test. Reply with OK."),
+                timeout=45,
+            )
             return {"ok": True, "output": str(result.output)[:100]}
 
         if method == "agent.send":
+            scope = params.get("scope")
+            if not scope:
+                batch_id = params.get("batchId") or self.store.get_current_batch()["id"]
+                scope = self.domain.build_scope(
+                    batch_id,
+                    params.get("filters") or {},
+                    params.get("selectedIds") if "selectedIds" in params else (
+                        [item["id"] for item in params.get("refs", []) if item.get("id")] or None
+                    ),
+                    params.get("scenarioId"),
+                    "snapshot",
+                )
             return await self.agent.start_run(
                 session_id=params["sessionId"],
                 text=params["text"],
@@ -237,26 +495,299 @@ class EngineApp:
                 provider_id=params["providerId"],
                 api_key=params.get("apiKey", ""),
                 auto_apply=bool(params.get("autoApply", False)),
+                scope=scope,
+                mode=str(params.get("mode", "analysis")),
+                budget={**DEFAULT_BUDGET, **(params.get("budget") or {})},
+                parent_run_id=params.get("parentRunId"),
+            )
+        if method == "agent.continue":
+            parent = self.store.get_run(params["runId"])
+            if parent["scope"].get("expired"):
+                raise ValueError("原分析范围已失效，请新建分析")
+            return await self.agent.start_run(
+                session_id=parent["sessionId"],
+                text=params.get("text") or "继续上次未完成的分析，保留原有证据并先说明剩余待验证项。",
+                refs=[],
+                provider_id=params["providerId"],
+                api_key=params.get("apiKey", ""),
+                auto_apply=bool(params.get("autoApply", False)),
+                scope=parent["scope"],
+                mode=parent["mode"],
+                budget={**parent["budget"], **(params.get("budget") or {})},
+                parent_run_id=parent["id"],
             )
         if method == "agent.stop":
             return self.agent.stop()
         if method == "agent.status":
             return self.agent.status()
+        if method == "agent.budget":
+            return self.agent.default_budget()
+        if method == "agent.budget.set":
+            return self.agent.set_default_budget(params.get("budget") or {})
         if method == "agent.approval":
             self.agent.resolve_approval(params["approvalId"], bool(params["approved"]))
             return {"ok": True}
         if method == "agent.host-result":
             self.agent.resolve_host_result(params["requestId"], params)
             return {"ok": True}
+        if method == "agent.runs":
+            return self.store.list_runs(params["sessionId"])
+        if method == "agent.run":
+            return self.store.get_run(params["runId"])
+        if method == "agent.events":
+            return self.store.list_events(
+                params["runId"],
+                int(params.get("afterSeq", 0)),
+                int(params.get("limit", 500)),
+            )
+        if method == "agent.evidence":
+            return self.store.list_evidence(params["runId"])
+        if method == "evidence.get":
+            return self.store.get_evidence(params["evidenceId"])
+
+        if method == "reports.list":
+            return self.store.list_reports(params.get("sessionId"))
+        if method == "reports.get":
+            return self.store.get_report(params["reportId"])
+        if method == "reports.save":
+            report = self.store.save_report(params)
+            emit("report:created", {"report": report})
+            return report
+        if method == "reports.delete":
+            self.store.delete_report(params["reportId"])
+            return {"ok": True}
+        if method == "reports.generate":
+            return await asyncio.to_thread(self._generate_report, params["runId"])
+        if method == "reports.export":
+            report = self.store.get_report(params["reportId"])
+            report["title"] = self.domain.redactor.text(str(report["title"]))
+            report["content"] = self.domain.redactor.text(str(report["content"]))
+            report["scope"] = self.domain.redactor.value(report.get("scope") or {})
+            format_name = str(params.get("format", "markdown"))
+            if format_name == "json":
+                content = json.dumps(report, ensure_ascii=False, indent=2)
+                extension = "json"
+            else:
+                content = report["content"]
+                extension = "md"
+            safe_title = "".join(
+                char if char.isalnum() or char in "-_ " else "-"
+                for char in report["title"]
+            ).strip()[:80] or "analysis-report"
+            return {
+                "fileName": f"{safe_title}.{extension}",
+                "content": content,
+                "format": format_name,
+            }
+
+        if method == "scenarios.list":
+            return self.store.list_scenarios(
+                params.get("batchId") or self.store.get_current_batch()["id"]
+            )
+        if method == "scenarios.start":
+            return self.store.start_scenario(
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params["name"],
+                params.get("device"),
+            )
+        if method == "scenarios.end":
+            return self.store.end_scenario(params["scenarioId"], params.get("includeIds"))
+        if method == "scenarios.get":
+            return self.store.get_scenario(params["scenarioId"])
+        if method == "scenarios.set-request":
+            self.store.set_scenario_request(
+                params["scenarioId"],
+                params["requestId"],
+                params.get("membership", "include"),
+                params.get("note", ""),
+            )
+            return self.store.get_scenario(params["scenarioId"])
+        if method == "scenarios.compare":
+            return await asyncio.to_thread(
+                self.domain.compare_scenarios,
+                params["scenarioIdA"],
+                params["scenarioIdB"],
+            )
+
+        if method == "configs.list":
+            return self.store.list_configs(params.get("kind"))
+        if method == "configs.save":
+            result = self.store.save_config(params)
+            if result["kind"] == "environment" and params.get("activate"):
+                self.store.set_setting("active_environment", result["id"])
+                self.store.set_setting(
+                    f"environment:{result['id']}",
+                    json.dumps(result["config"] | {"name": result["name"]}, ensure_ascii=False),
+                )
+            emit("configs:changed", self.store.list_configs())
+            return result
+        if method == "configs.delete":
+            self.store.delete_config(params["configId"])
+            if self.store.get_setting("active_environment") == params["configId"]:
+                self.store.set_setting("active_environment", "")
+            emit("configs:changed", self.store.list_configs())
+            return {"ok": True}
+        if method == "configs.activate-environment":
+            config = next(
+                (item for item in self.store.list_configs("environment") if item["id"] == params["configId"]),
+                None,
+            )
+            if config is None:
+                raise ValueError("环境配置不存在")
+            self.store.set_setting("active_environment", config["id"])
+            self.store.set_setting(
+                f"environment:{config['id']}",
+                json.dumps(config["config"] | {"name": config["name"]}, ensure_ascii=False),
+            )
+            emit("config:changed", {"version": self.store.config_version()})
+            return self._current_environment()
+
+        if method == "debug.preview":
+            return self.domain.preview_debug_action(params["actionType"], params.get("payload") or {})
+        if method == "debug.apply":
+            action = self.domain.apply_debug_action(params["actionId"])
+            self.proxy.refresh_rules()
+            if action["type"] == "throttle" and action["status"] == "applied":
+                throttle_value = action["preview"]["payload"]
+                result = self.throttle.update(
+                    bool(throttle_value.get("enabled", True)),
+                    int(throttle_value.get("upKbPerSecond", 0)),
+                    int(throttle_value.get("downKbPerSecond", 0)),
+                    int(throttle_value.get("latencyMs", 0)),
+                )
+                self.store.set_setting("throttle", json.dumps(result))
+                emit("proxy:throttle", result)
+            emit("debug:action", {"action": action})
+            emit("config:changed", {"version": self.store.config_version()})
+            return action
+        if method == "debug.restore":
+            action = self.domain.restore_debug_action(params["actionId"])
+            self.proxy.refresh_rules()
+            if action["type"] == "throttle" and action["status"] == "restored":
+                throttle_value = action["before"].get("throttle") or {}
+                result = self.throttle.update(
+                    bool(throttle_value.get("enabled", False)),
+                    int(throttle_value.get("upKbPerSecond", 0)),
+                    int(throttle_value.get("downKbPerSecond", 0)),
+                    int(throttle_value.get("latencyMs", 0)),
+                )
+                self.store.set_setting("throttle", json.dumps(result))
+                emit("proxy:throttle", result)
+            emit("debug:action", {"action": action})
+            emit("config:changed", {"version": self.store.config_version()})
+            return action
+        if method == "debug.actions":
+            return self.store.list_debug_actions(int(params.get("limit", 100)))
+        if method == "debug.verify":
+            return await asyncio.to_thread(
+                self.domain.verify_debug_action,
+                params["actionId"],
+                source_ip=str(params.get("sourceIp", "")),
+                limit=int(params.get("limit", 200)),
+            )
+
+        if method == "imports.list":
+            return self.store.list_imports()
+        if method == "imports.har":
+            data = self._json_param(params)
+            return await asyncio.to_thread(
+                self.domain.import_har, data, params.get("batchLabel")
+            )
+        if method == "imports.openapi":
+            data = self._json_param(params)
+            return await asyncio.to_thread(
+                self.domain.import_openapi,
+                data,
+                str(params.get("name") or "OpenAPI"),
+            )
+        if method == "imports.otlp":
+            data = self._json_param(params)
+            return await asyncio.to_thread(
+                self.domain.import_otlp,
+                data,
+                str(params.get("source") or "OTLP JSON"),
+            )
+        if method == "exports.har":
+            return await asyncio.to_thread(
+                self.domain.export_har,
+                params.get("batchId") or self.store.get_current_batch()["id"],
+                params,
+            )
+        if method == "openapi.validate":
+            return await asyncio.to_thread(
+                self.domain.validate_openapi,
+                params["requestId"],
+                params.get("configId"),
+            )
+        if method == "openapi.templates":
+            return await asyncio.to_thread(self._path_templates, params.get("configId"))
+        if method == "observability.query":
+            return await asyncio.to_thread(
+                self.domain.query_observability,
+                params["endpoint"],
+                params["traceId"],
+            )
+
+        if method == "replay.preview":
+            return await asyncio.to_thread(
+                self.domain.replay,
+                params["requestId"],
+                execute=False,
+                edits=params.get("edits"),
+                override_url=str(params.get("overrideUrl", "")),
+                action_id=params.get("actionId"),
+            )
+        if method == "replay.execute":
+            return await asyncio.to_thread(
+                self.domain.replay,
+                params["requestId"],
+                execute=True,
+                override_url=str(params.get("overrideUrl", "")),
+                action_id=params.get("actionId"),
+            )
+
+        if method == "mcp.servers":
+            return self.store.list_mcp_servers()
+        if method == "mcp.save":
+            return self.store.save_mcp_server(params)
+        if method == "mcp.call":
+            return await asyncio.to_thread(
+                self.domain.call_mcp_tool,
+                params["serverId"],
+                params["toolName"],
+                params.get("arguments") or {},
+            )
+        if method == "tickets.preview":
+            return await asyncio.to_thread(
+                self.domain.create_ticket,
+                params["reportId"],
+                str(params.get("endpoint", "")),
+                False,
+                params.get("ticketId"),
+            )
+        if method == "tickets.create":
+            return await asyncio.to_thread(
+                self.domain.create_ticket,
+                params["reportId"],
+                params["endpoint"],
+                True,
+                params.get("ticketId"),
+            )
+        if method == "checklist.generate":
+            return self.domain.test_checklist(params.get("requestIds") or [])
 
         if method == "certificate.info":
             return self.certificate_info()
         if method == "storage.info":
             return self.store.storage_info()
         if method == "storage.clear-all":
-            for batch in self.store.list_batches():
-                self.store.clear_batch(batch["id"])
-            return self.store.storage_info()
+            await self._quiesce()
+            local_state = {"projectId": self.projects["active"], "batchIds": [item["id"] for item in self.store.list_batches()], "sessionIds": [item["id"] for item in self.store.list_sessions()], "reportIds": [item["id"] for item in self.store.list_reports()]}
+            self.store.clear_all(str(params.get("scope", "analysis")))
+            self.proxy.refresh_rules()
+            self._load_settings()
+            emit("capture:cleared", {})
+            return {**self.store.storage_info(), "clearedLocalState": local_state}
         if method == "app.set-port":
             if self.proxy.running:
                 raise ValueError("请先停止代理，再修改监听端口")
@@ -270,6 +801,115 @@ class EngineApp:
             return {"ok": True}
         raise ValueError(f"未知方法: {method}")
 
+    def _generate_report(self, run_id: str) -> dict[str, Any]:
+        run = self.store.get_run(run_id)
+        evidence = self.store.list_evidence(run_id)
+        scope = run["scope"]
+        summary = run.get("summary") or "模型未返回结论，请查看执行事件。"
+        lines = [
+            f"# {scope.get('batchLabel') or '抓包分析'}：分析报告",
+            "",
+            "## 环境与分析范围",
+            "",
+            f"- 批次：{scope.get('batchLabel')} (`{scope.get('batchId')}`)",
+            f"- 设备：{', '.join(scope.get('devices') or []) or '未指定'}",
+            f"- 范围样本：{scope.get('requestCount')} / 批次总数 {scope.get('batchCount')}",
+            f"- 快照时间：{scope.get('snapshotAt')}",
+            f"- 环境：{', '.join(scope.get('environments') or []) or '未记录'}",
+            f"- App 版本：{', '.join(scope.get('appVersions') or []) or '未记录'}",
+            f"- 构建号：{', '.join(scope.get('buildNumbers') or []) or '未记录'}",
+            f"- 配置版本：{scope.get('configVersion')} / {scope.get('configHash')}",
+            f"- 运行模式：{run['mode']}",
+            "",
+            "## 调查结论、候选原因与待查",
+            "",
+            summary,
+            "",
+            "## 关键证据",
+            "",
+        ]
+        if evidence:
+            for item in evidence:
+                state = item["state"]
+                lines.append(
+                    f"- `{item['requestId']}` v{item['requestVersion']} · "
+                    f"{item['direction']} `{item['locator'] or ''}` · {item['summary']} · 状态 `{state}`"
+                )
+        else:
+            lines.append("- 本轮没有生成结构化证据，结论完整性受限。")
+        lines.extend(
+            [
+                "",
+                "## 数据缺口与边界",
+                "",
+                "- 手机代理只观察经过本应用的流量；服务内部 Span 需要导入后才会出现。",
+                f"- 未完成请求：{scope.get('unfinishedCount', 0)}。",
+                "- 正文缺失、流式未保存或采集截断会在对应证据中标记。",
+                "",
+                "## 复现与验证",
+                "",
+                "- 在相同设备、环境、账号和业务前置条件下再次执行同一操作。",
+                "- 对关键失败字段和成功样本执行字段对比，并新增捕获记录验证。",
+            ]
+        )
+        lines.extend(["", "## 已观察事实与复现请求", ""])
+        for source in (scope.get("requestVersions") or [])[:50]:
+            try:
+                row = self.store.request_summary(source["id"])
+                valid = row["version"] == source["version"]
+                lines.append(f"- `{row['id']}` v{source['version']} · {'有效' if valid else '已变化，当前值不可充当原事实'} · {row['method']} {self.domain.redactor.url(row['url'])} · HTTP {row.get('status')} · {row.get('durationMs')} ms · {row.get('startedAt')}")
+            except ValueError:
+                lines.append(f"- `{source['id']}` 已删除，无法回溯原事实。")
+        lines.extend(["", "## 预期与实际", "", "- 预期：以业务需求和下方人工验证清单为准；未记录的预期须由复核者补充。", "- 实际：仅以有效版本的抓包与结构化证据为准。候选原因仍需人工验证。", "", "## 相关调试动作", ""])
+        actions = [item for item in self.store.list_debug_actions() if item["preview"].get("payload", {}).get("ownerRunId") == run_id]
+        lines.extend([f"- `{item['id']}` · {item['type']} · {item['status']} · {item['createdAt']}" for item in actions] or ["- 本轮无关联调试动作。"])
+        ids = {item["id"] for item in scope.get("requestVersions") or []}
+        lines.extend(["", "## 人工验证清单", ""])
+        for checklist in self.store.list_configs("qa_checklist"):
+            for check in checklist["config"].get("items") or []:
+                if ids.intersection(check.get("requestIds") or []):
+                    lines.append(f"- [{check.get('status', 'pending')}] {check.get('step')}；预期：{check.get('expected')}；备注：{check.get('note', '')}；证据：{', '.join(check.get('requestIds') or [])}")
+        return self.store.save_report(
+            {
+                "sessionId": run["sessionId"],
+                "runId": run_id,
+                "title": f"{scope.get('batchLabel') or '抓包'} · 分析报告",
+                "content": "\n".join(lines),
+                "scope": scope,
+                "status": "draft",
+            }
+        )
+
+    def _path_templates(self, config_id: str | None = None) -> list[dict[str, Any]]:
+        configs = [
+            item
+            for item in self.store.list_configs("openapi")
+            if item["enabled"] and (config_id is None or item["id"] == config_id)
+        ]
+        batch = self.store.get_current_batch()
+        aggregate = self.domain.aggregate(batch["id"], {}, "endpoint")
+        templates = []
+        for group in aggregate["groups"]:
+            url = group["key"].split(" ", 1)[-1]
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(url)
+            candidates = self.domain.openapi_candidates(group["key"].split(" ", 1)[0], parsed.path, configs)
+            matched = None
+            if candidates:
+                config, operation, template = candidates[0]
+                matched = {"configId": config["id"], "template": template, "operationId": operation.get("operationId")}
+            templates.append({"endpoint": group["key"], "openapi": matched})
+        return templates
+
+    @staticmethod
+    def _json_param(params: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(params.get("data"), dict):
+            return params["data"]
+        if isinstance(params.get("json"), str):
+            return json.loads(params["json"])
+        raise ValueError("缺少 JSON 导入数据")
+
     def certificate_info(self) -> dict[str, Any]:
         cert = self.proxy.cert_dir / "mitmproxy-ca-cert.pem"
         return {
@@ -278,6 +918,9 @@ class EngineApp:
             "url": "http://mitm.it/",
             "directory": str(self.proxy.cert_dir),
         }
+
+    def _request_detail(self, request_id: str) -> dict[str, Any]:
+        return self._with_body_preview(self.store.request_detail(request_id, preview_chars=16_000))
 
     @staticmethod
     def _with_body_preview(detail: dict[str, Any]) -> dict[str, Any]:
@@ -288,8 +931,11 @@ class EngineApp:
             path = Path(body["path"])
             if not path.exists():
                 continue
+            if path.stat().st_size > 1_500_000:
+                continue
             data = path.read_bytes()
-            content_type = str(detail.get("contentType") or "").lower()
+            direction = "request" if key == "requestBody" else "response"
+            content_type = next((v for k, v in detail[f"{direction}Headers"] if k.lower() == "content-type"), "").lower()
             if content_type.startswith("image/") and len(data) <= 1_500_000:
                 body["base64"] = base64.b64encode(data).decode("ascii")
                 body["mime"] = content_type.split(";", 1)[0]
