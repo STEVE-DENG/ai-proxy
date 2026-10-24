@@ -1,0 +1,23 @@
+name: Feature request / 功能建议
+description: 描述具体 QA 场景、当前障碍及预期行为。
+title: "[Feature] "
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 场景与当前问题
+      description: 谁在什么操作中遇到什么障碍？请先检查 docs/roadmap.md。
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 期望的行为
+      description: 用户入口、输入、输出，以及可观察的完成条件。
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: 约束与替代方案
+      description: 是否需要外部平台、写操作、真实环境授权或新数据权限？不附凭据。

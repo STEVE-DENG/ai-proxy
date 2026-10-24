@@ -1,75 +1,86 @@
 # AI Proxy
 
-一个本地 macOS HTTP(S) 调试代理。应用包含 Codex 式 AI 工作区、Charles 式抓包树、Map Local、Map Remote、Rewrite、代理弱网和手机接入，不需要单独部署服务端。
+本地 HTTP(S) 抓包、AI 调查与 QA 复现工作台，面向 macOS。
 
-## 技术结构
+[English](README.en.md) · [使用指南](docs/user-guide.md) · [完整功能](docs/features.md) · [开发指南](docs/development.md) · [实施状态](docs/roadmap.md)
 
-- `src/`：React + TypeScript 界面。
-- `src-tauri/`：Tauri 2 桌面层、Keychain、文件选择器和 macOS 系统代理。
-- `engine/`：Python 本地引擎，使用 mitmproxy、PydanticAI 和 SQLite。
-- 前端与引擎通过 Rust 管理的私有 stdin/stdout 消息通信；手机端口只提供代理和证书引导。
+把抓包树、固定范围的 AI Agent、字段证据、请求重放、故障矩阵和缺陷报告放在同一个桌面应用里。抓包和本地分析无需部署服务端；AI 分析需配置你自己的模型供应商。
 
-## 本地开发
+> **开发预览，版本 0.1.0。** 已完成本地构建、打包和部分功能核查；真实 Provider、持续采集、多设备与完整桌面验收仍待手动完成。[验收记录与未覆盖项](docs/validation.md)。当前构建为 ad-hoc 签名，未公证；不将开发产物标为稳定发行版。
 
-要求：macOS、Node.js、Rust、`uv`。
+## 可以用它做什么
+
+| 场景 | 能力 |
+| --- | --- |
+| 排查接口 | Host/路径抓包树、时序、组合筛选、分页与虚拟列表，按需读取正文和 JSON Pointer |
+| 让 AI 查证 | 固定样本与版本，调用检索/聚合/字段/Diff/Trace 工具，结论附证据与未检查范围 |
+| 调试与复现 | Map Local/Remote、Rewrite、弱网，变更预览与恢复；编辑重放、变量步骤、故障矩阵 |
+| 回归与交接 | 成功基线、业务键配对、可编辑人工清单，Markdown/JSON 报告与脱敏证据包 |
+| 交换数据 | HAR 导入/导出、OpenAPI/Swagger JSON 子集校验、OTLP JSON Span 导入 |
+| 分离项目 | 独立数据库、正文、规则、环境、场景与模型历史；API Key 存储在 macOS Keychain |
+
+Agent 默认只读；调试模式的写操作需要预览和审批。开启自动执行会跳过后续审批，请在理解具体变更后使用。平台集成仍有边界：现有有限 HTTP MCP/Trace GET/Webhook 入口不等于标准 MCP 客户端或已完成的真实平台适配。
+
+## 从源码运行
+
+需要 macOS、Xcode Command Line Tools、Node.js 22+、Rust stable 和 `uv`。引擎固定使用 Python 3.12，`uv` 可管理该解释器。当前只核查过 Apple Silicon 本机产物；Intel Mac 尚待验证，Windows/Linux 暂不支持桌面功能。
 
 ```bash
-npm install
+git clone https://github.com/STEVE-DENG/ai-proxy.git
+cd ai-proxy
+npm ci
 npm run engine:sync
+```
+
+Tauri 的构建配置声明了 sidecar。全新 checkout 先冻结一次引擎以满足构建期文件检查：
+
+```bash
+npm run engine:freeze
 npm run tauri dev
 ```
 
-开发模式优先使用 `engine/.venv/bin/python` 启动引擎，不依赖已冻结的 sidecar。
+开发模式运行 `engine/.venv/bin/python`，优先使用当前 Python 源码。单独 `npm run dev` 只有界面开发服务器，无法提供完整桌面 IPC 能力。详细环境、命令和排障见 [开发指南](docs/development.md)。
 
-## 打包
+## 第一次使用
+
+想先离线查看数据，可手动导入 [合成 HAR / OpenAPI / OTLP 示例](examples/README.md)，无需开启代理或调用模型。
+
+1. 进入「抓包」，开始采集；在设置的代理入口启用本机系统代理。HTTPS 还需安装并信任应用生成的 CA。
+2. 发起自己可控制的请求，在 Host/路径树中查看详情、筛选或对比。手机可从「连接手机」配置同一 Wi-Fi 下的代理和 CA。
+3. 在设置中配置模型供应商，选择当前筛选、多选请求或场景发起只读分析；点击证据返回原请求。
+4. 从工作台进入重放、基线回归、故障矩阵、人工验证和证据交接。重放会真实发送请求，请先核对预览。
+5. 结束后停止采集，关闭手机 Wi-Fi 代理，并核对 Mac 系统代理已恢复。
+
+HTTPS 默认解密全部域名；可以一键关闭或仅对特定 Host 开启。仅在你有权调试的设备与环境中使用。模型请求会发送脱敏后的上下文到所配置供应商，脱敏规则不能保证清除自由文本中的所有隐私。[数据与安全边界](SECURITY.md)。
+
+## 本地打包
 
 ```bash
 npm run engine:freeze
 npm run app:build
 ```
 
-输出位置：
+输出：`src-tauri/target/release/bundle/macos/AI Proxy.app`。sidecar 为当前 Mac 架构，应用不需要目标机器另装 Python。分发签名、公证和验收要求见 [发布说明](docs/releasing.md)。构建目录和本地抓包数据不提交到 Git。
 
-```text
-src-tauri/target/release/bundle/macos/AI Proxy.app
-```
+## 文档导航
 
-`engine:freeze` 会生成当前 Mac 架构的 PyInstaller 单文件引擎，并原子替换 `src-tauri/binaries/` 中的 sidecar。当前配置使用 ad-hoc 签名且未公证，适合本机使用；对外分发需要 Developer ID 签名和 Apple 公证。
+| 文档 | 内容 |
+| --- | --- |
+| [使用指南](docs/user-guide.md) | CA、手机接入、分析、调试、QA 与数据交换 |
+| [完整功能与边界](docs/features.md) | 功能细节、数据限额、协议与契约支持范围 |
+| [架构说明](docs/architecture.md) | React → Tauri → Python、持久化、Scope 和审批 |
+| [开发指南](docs/development.md) | 环境、锁文件、检查、CI 和源码导航 |
+| [故障排查](docs/troubleshooting.md) | 引擎、证书、代理恢复、缺失正文与过期证据 |
+| [人工验收](docs/validation.md) | 已执行检查、未验收场景和可复制记录模板 |
+| [实施状态与路线图](docs/roadmap.md) | 第二轮49项状态与下一步；附第一轮119项映射 |
+| [变更记录](CHANGELOG.md) | 已提交开发变化与发布边界 |
 
-## 使用
+## 参与贡献
 
-### 本机抓包
+欢迎提交可复现的问题、文档修正和范围明确的 Pull Request。先阅读 [贡献指南](CONTRIBUTING.md)；普通问题使用 [GitHub Issues](https://github.com/STEVE-DENG/ai-proxy/issues)。涉及凭据、CA 私钥或原始抓包的安全问题，请使用 [安全报告流程](SECURITY.md)。
 
-1. 打开「抓包」，点击「开始抓包」。
-2. 在「设置 → 抓包与代理」中开启本机系统代理，按 macOS 提示完成管理员授权。
-3. 请求会按 Host / Path 显示；重复 URL 会保留为独立请求。
-4. 退出应用会尝试恢复开启前的系统代理。强制结束进程时不保证立即恢复，可在系统设置中手动关闭。
+本项目当前使用构建检查、隔离数据核查和人工验收，不维护自动化测试套件。CI 不调用真实供应商、不启动系统代理，绿色检查不代表真实环境验收通过。
 
-### 手机接入
+## 许可证
 
-1. 手机与 Mac 连接同一 Wi-Fi，打开「连接手机」，点击「开启手机 HTTPS 抓包」。
-2. 用手机浏览器扫描证书二维码并打开局域网证书页。iOS 安装 `.mobileconfig` 描述文件；Android 下载 `.crt` CA 证书。
-3. iOS 还需到「设置 → 通用 → 关于本机 → 证书信任设置」开启完全信任；Android 需在系统设置中安装用户 CA。
-4. 在手机当前 Wi-Fi 的 HTTP 代理中填写页面显示的 Mac IP 和端口，然后重新打开目标 App。
-5. 抓包结束后关闭手机 Wi-Fi 代理。
-
-Mac 和手机都必须信任本应用生成的 CA。HTTPS 默认开启全部域名解密；抓包工具栏和「连接手机」中都可以一键关闭。关闭后仍会记录 HTTPS 的 CONNECT 连接，可在 Host 节点单独重新开启该域解密。解密设置只影响新连接。
-
-### Agent
-
-在设置中配置 OpenAI Responses、OpenAI Chat Completions 或 Anthropic Messages 供应商。API Key 保存在 macOS 钥匙串，不写入 SQLite、对话或抓包记录。
-
-Agent 只能调用应用提供的抓包、规则、弱网和系统代理工具。修改配置前默认请求审批；开启「自动执行」后本会话后续配置操作直接执行。Map Local 只能使用当前会话中由用户主动共享的文件。
-
-### 弱网
-
-弱网限制作用于经过本代理的所有本机和手机流量，上下行共享全局预算。它不修改系统网卡，也不模拟丢包。
-
-## 已知边界
-
-- 首版重点支持 HTTP/1.1 和 HTTP/2；WebSocket 可转发并显示握手，不提供帧级编辑。
-- 不支持 HTTP/3/QUIC、原始 TCP/UDP、gRPC 解码。
-- Android 7+ 的正式 App 可能不信任用户 CA；证书固定的 App 无法仅靠代理获取明文。
-- 设备未信任 CA 时不能解密 HTTPS；请先在证书页完成安装和完全信任。
-- 流式或超过 5 MiB 的正文只保留有限记录，不会执行整段正文替换。
-- 抓包内容可能包含隐私数据。模型分析时会对常见认证 Header 脱敏，但不会自动移除业务正文中的敏感信息。
+项目原创代码使用 [MIT License](LICENSE)。第三方依赖、字体和工具保留各自许可证；打包分发时也需遵守其条款。

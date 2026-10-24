@@ -1,0 +1,173 @@
+{
+  "log": {
+    "version": "1.2",
+    "creator": {
+      "name": "AI Proxy synthetic documentation sample",
+      "version": "1"
+    },
+    "entries": [
+      {
+        "startedDateTime": "2026-10-24T02:00:00.000Z",
+        "time": 25,
+        "request": {
+          "method": "GET",
+          "url": "https://demo.invalid/api/items?id=0",
+          "httpVersion": "HTTP/1.1",
+          "cookies": [],
+          "headers": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "traceparent",
+              "value": "00-0123456789abcdef0123456789abcdef-1111111111111111-01"
+            }
+          ],
+          "queryString": [
+            {
+              "name": "id",
+              "value": "0"
+            }
+          ],
+          "headersSize": -1,
+          "bodySize": 0
+        },
+        "response": {
+          "status": 200,
+          "statusText": "OK",
+          "httpVersion": "HTTP/1.1",
+          "cookies": [],
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "content": {
+            "size": 100,
+            "mimeType": "application/json",
+            "text": "{\"synthetic\": true, \"code\": 0, \"data\": {\"items\": [{\"id\": 0, \"name\": \"Demo item\"}]}, \"message\": \"ok\"}"
+          },
+          "redirectURL": "",
+          "headersSize": -1,
+          "bodySize": 100
+        },
+        "cache": {},
+        "timings": {
+          "send": 1,
+          "wait": 20,
+          "receive": 4
+        }
+      },
+      {
+        "startedDateTime": "2026-10-24T02:00:01.000Z",
+        "time": 35,
+        "request": {
+          "method": "GET",
+          "url": "https://demo.invalid/api/items?id=1",
+          "httpVersion": "HTTP/1.1",
+          "cookies": [],
+          "headers": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "traceparent",
+              "value": "00-0123456789abcdef0123456789abcdef-1111111111111111-01"
+            }
+          ],
+          "queryString": [
+            {
+              "name": "id",
+              "value": "1"
+            }
+          ],
+          "headersSize": -1,
+          "bodySize": 0
+        },
+        "response": {
+          "status": 200,
+          "statusText": "OK",
+          "httpVersion": "HTTP/1.1",
+          "cookies": [],
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "content": {
+            "size": 100,
+            "mimeType": "application/json",
+            "text": "{\"synthetic\": true, \"code\": 0, \"data\": {\"items\": [{\"id\": 1, \"name\": \"Demo item\"}]}, \"message\": \"ok\"}"
+          },
+          "redirectURL": "",
+          "headersSize": -1,
+          "bodySize": 100
+        },
+        "cache": {},
+        "timings": {
+          "send": 1,
+          "wait": 30,
+          "receive": 4
+        }
+      },
+      {
+        "startedDateTime": "2026-10-24T02:00:02.000Z",
+        "time": 45,
+        "request": {
+          "method": "GET",
+          "url": "https://demo.invalid/api/items?id=2",
+          "httpVersion": "HTTP/1.1",
+          "cookies": [],
+          "headers": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "traceparent",
+              "value": "00-0123456789abcdef0123456789abcdef-1111111111111111-01"
+            }
+          ],
+          "queryString": [
+            {
+              "name": "id",
+              "value": "2"
+            }
+          ],
+          "headersSize": -1,
+          "bodySize": 0
+        },
+        "response": {
+          "status": 500,
+          "statusText": "Internal Server Error",
+          "httpVersion": "HTTP/1.1",
+          "cookies": [],
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "content": {
+            "size": 86,
+            "mimeType": "application/json",
+            "text": "{\"synthetic\": true, \"code\": 5001, \"data\": null, \"message\": \"Synthetic upstream error\"}"
+          },
+          "redirectURL": "",
+          "headersSize": -1,
+          "bodySize": 86
+        },
+        "cache": {},
+        "timings": {
+          "send": 1,
+          "wait": 40,
+          "receive": 4
+        }
+      }
+    ]
+  }
+}

@@ -17,3 +17,12 @@ __pycache__
 *.p12
 *.cer
 *.pem
+*.key
+*.crt
+*.mobileconfig
+*.har
+*.sqlite3-*
+*.db-*
+*.app/
+*.dmg
+AI-Proxy-*.zip

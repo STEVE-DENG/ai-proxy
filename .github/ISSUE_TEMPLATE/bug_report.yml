@@ -1,0 +1,47 @@
+name: Bug report / 问题报告
+description: 提交最小可复现问题，请勿上传凭据或原始业务抓包。
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先查看 README 的支持边界和 docs/troubleshooting.md。
+        安全漏洞请按 SECURITY.md 私下报告；示例、截图、日志需人工去除隐私。
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / Git commit
+      placeholder: "0.1.0 / commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: macOS / CPU 架构 / 设备
+      placeholder: "macOS 版本、arm64/Intel，是否连接手机"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 最小复现步骤
+      description: 包含入口、项目/批次、筛选、代理/解密/规则配置，使用合成数据。
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期与实际结果
+      description: 如有截断、partial、unknown、工具错误等状态，请原样描述。
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider 协议 / 模型（仅模型问题）
+      description: 不填写 API Key、含凭据的 URL 或个人账户信息。
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 补充证据
+      description: 脱敏日志、截图、合成样本，或性能问题的样本量/耗时/内存/丢失量。

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security / 安全问题
+    url: https://github.com/STEVE-DENG/ai-proxy/blob/main/SECURITY.md
+    about: 安全漏洞或敏感数据问题请先阅读私密报告流程。

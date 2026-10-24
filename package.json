@@ -2,13 +2,25 @@
   "name": "ai-proxy",
   "private": true,
   "version": "0.1.0",
+  "description": "Local HTTP(S) capture and AI-assisted QA workbench for macOS",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/STEVE-DENG/ai-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/STEVE-DENG/ai-proxy/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "engine:sync": "uv sync --project engine",
+    "engine:sync": "uv sync --locked --project engine",
     "engine:freeze": "bash scripts/freeze-engine.sh",
     "app:build": "npm run build && tauri build"
   },

@@ -2,8 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT/engine"
-uv sync --project . --group dev
-uv run --project . pyinstaller \
+uv sync --locked --project . --group dev
+uv run --locked --project . pyinstaller \
   --noconfirm \
   --clean \
   --onefile \
