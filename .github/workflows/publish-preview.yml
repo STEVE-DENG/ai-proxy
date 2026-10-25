@@ -89,14 +89,15 @@ jobs:
           fi
           gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --title "AI 抓包助手 $version · 中文开发预览" --notes-file "$RUNNER_TEMP/release-notes.md"
           gh release upload "$RELEASE_TAG" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-preview.dmg#Apple芯片安装包（DMG）" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-preview.zip#Apple芯片压缩包（ZIP）" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-SHA256SUMS.txt#SHA-256文件校验清单" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-build.json#源码与构建信息"
-          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/uploaded-release.json"
+          # 草稿不能依赖按标签查询；从有写权限的发行列表中匹配。
+          gh api "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/uploaded-releases.json"
           node --input-type=module <<'JS'
           import fs from 'node:fs';
           const version=JSON.parse(fs.readFileSync('package.json')).version;
           const dir=`release/${version}/macos-arm64`,build=JSON.parse(fs.readFileSync(`${dir}/build.json`));
-          const remote=JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/uploaded-release.json`));
+          const remote=JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/uploaded-releases.json`)).find(item=>item.tag_name===`v${version}`);
           const expected=build.assets.concat([`AI-Proxy-${version}-macos-arm64-SHA256SUMS.txt`,`AI-Proxy-${version}-macos-arm64-build.json`].map(name=>({name,bytes:fs.statSync(`${dir}/${name}`).size})));
-          if(!remote.draft||remote.tag_name!==`v${version}`||remote.assets.length!==expected.length)throw new Error('草稿附件不完整');
+          if(!remote||!remote.draft||remote.tag_name!==`v${version}`||remote.assets.length!==expected.length)throw new Error('草稿附件不完整');
           for(const item of expected){const asset=remote.assets.find(a=>a.name===item.name);if(!asset||asset.state!=='uploaded'||asset.size!==item.bytes||(item.sha256&&asset.digest&&asset.digest!==`sha256:${item.sha256}`))throw new Error(`远端附件校验失败：${item.name}`);}
           JS
           gh release edit "$RELEASE_TAG" --draft=false --prerelease

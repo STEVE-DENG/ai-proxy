@@ -259,3 +259,19 @@ Developer ID、公证、双架构远端构建、GitHub Release、Intel/另一台
 | `ai-proxy-engine` | `e6fab07f7f51fe80357b6de466ac044e1db46fcc2b7a1c47e6aa5b802216c124` |
 
 分发产物位于`release/0.2.1/macos-arm64/`；包内安装说明为中文，并包含依赖许可与源码获取说明。发布状态和文件摘要以[0.2.1版本页](https://github.com/STEVE-DENG/ai-proxy/releases/tag/v0.2.1)与对应校验文件为准。原TODO不因本次发布关闭。
+
+
+### 0.2.1 公开结果
+
+2026-10-25 13:22（上海时间），[0.2.1中文开发预览](https://github.com/STEVE-DENG/ai-proxy/releases/tag/v0.2.1)已公开；API复核`draft=false`、`prerelease=true`，四个附件均为`uploaded`，下载标签使用中文。`main`已快进同步；源码标签仍固定为`cf95c019f5d27b02f7a0fc55262a018743efa425`。
+
+[远端构建](https://github.com/STEVE-DENG/ai-proxy/actions/runs/40163850766)的构建/打包与来源检查通过，上传后按标签查询草稿失败；[恢复任务](https://github.com/STEVE-DENG/ai-proxy/actions/runs/40165296201)成功，下载既有四个附件，核对标签源码提交、构建信息、文件大小、SHA-256和校验清单后公开，未重建或覆盖附件。后续发布流程改用具备写权限的发行列表匹配草稿，并移除一次性恢复工作流。
+
+GitHub发布包由CI独立构建，与本机预览包摘要不同；公开下载以以下值及同次Release附件为准：
+
+| 文件 | 字节 | SHA-256 |
+| --- | --- | --- |
+| `AI-Proxy-0.2.1-macos-arm64-preview.dmg` | 55794399 | `445ebe2c4ce6bba82ed52b7ceb0eb9cb837debc1728530da74c470facca66c76` |
+| `AI-Proxy-0.2.1-macos-arm64-preview.zip` | 53979800 | `682af03f1719ebc00f3dba9950c4ff00486f8a4f5a25350687b1e24526a0a100` |
+
+本机Applications已安全更新至0.2.1；旧包备份为`/Applications/.AI Proxy.backup-2026-10-25T04-37-08-050Z.app`，未启动。正式签名、公证、Intel和真实功能验收仍未完成，原TODO继续保留。
