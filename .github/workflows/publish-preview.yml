@@ -1,0 +1,102 @@
+name: 发布中文开发预览
+
+on:
+  push:
+    branches: ["codex/publish-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: 构建并发布 Apple 芯片预览版
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - name: 核对明确的发布分支
+        id: version
+        env:
+          PUBLISH_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$PUBLISH_BRANCH" =~ ^codex/publish-(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo '发布分支必须为 codex/publish-v主版本.次版本.补丁版本'
+            exit 1
+          fi
+          echo "tag=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.10.7"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: engine/uv.lock
+      - name: 安装锁定依赖
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          npm ci
+          uv sync --locked --project engine --group dev
+      - name: 静态检查与分发包构建
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          node -e 'if (process.env.RELEASE_TAG !== "v"+require("./package.json").version) throw new Error("版本标签与源码不一致")'
+          uv run --locked --project engine python -m compileall -q engine/ai_proxy_engine
+          cargo fmt --check --manifest-path src-tauri/Cargo.toml
+          npm run release:prepare
+      - name: 核对来源并准备中文发布说明
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          import {verifyBuild,sha256} from './scripts/build-metadata.mjs';
+          verifyBuild('src-tauri/target/release/bundle/macos/AI Proxy.app');
+          const version=JSON.parse(fs.readFileSync('package.json')).version;
+          const dir=`release/${version}/macos-arm64`,data=JSON.parse(fs.readFileSync(`${dir}/build.json`));
+          const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
+          if(data.version!==version||data.platform!=='macos-arm64'||data.dirtyWorkingTree||data.commit!==commit||data.licenseTextReviewCount!==0||data.assets.length!==2||fs.existsSync(`${dir}/INCOMPLETE.txt`))throw new Error('构建来源或依赖声明未通过核对');
+          for(const asset of data.assets)if(asset.name.includes('/')||sha256(`${dir}/${asset.name}`)!==asset.sha256)throw new Error('分发文件校验失败');
+          const icon=`<img src="https://raw.githubusercontent.com/${process.env.GITHUB_REPOSITORY}/${process.env.RELEASE_TAG}/public/brand/app-icon.png" alt="应用图标" width="88" />\n\n`;
+          const notes=icon+fs.readFileSync(`docs/release-notes-${version}.md`,'utf8')+`\n\n## 本次构建与文件校验\n\n源码提交：\`${commit}\`。\n\n`+data.assets.map(a=>`- \`${a.name}\`：\`${a.sha256}\``).join('\n')+'\n';
+          fs.writeFileSync(`${process.env.RUNNER_TEMP}/release-notes.md`,notes);
+          JS
+      - name: 上传附件并公开为预发行
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo '该版本已有Release，停止以避免覆盖已有发行。'
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --title "AI 抓包助手 $version · 中文开发预览" --notes-file "$RUNNER_TEMP/release-notes.md"
+          gh release upload "$RELEASE_TAG" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-preview.dmg#Apple芯片安装包（DMG）" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-preview.zip#Apple芯片压缩包（ZIP）" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-SHA256SUMS.txt#SHA-256文件校验清单" "release/$version/macos-arm64/AI-Proxy-$version-macos-arm64-build.json#源码与构建信息"
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/uploaded-release.json"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const version=JSON.parse(fs.readFileSync('package.json')).version;
+          const dir=`release/${version}/macos-arm64`,build=JSON.parse(fs.readFileSync(`${dir}/build.json`));
+          const remote=JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/uploaded-release.json`));
+          const expected=build.assets.concat([`AI-Proxy-${version}-macos-arm64-SHA256SUMS.txt`,`AI-Proxy-${version}-macos-arm64-build.json`].map(name=>({name,bytes:fs.statSync(`${dir}/${name}`).size})));
+          if(!remote.draft||remote.tag_name!==`v${version}`||remote.assets.length!==expected.length)throw new Error('草稿附件不完整');
+          for(const item of expected){const asset=remote.assets.find(a=>a.name===item.name);if(!asset||asset.state!=='uploaded'||asset.size!==item.bytes||(item.sha256&&asset.digest&&asset.digest!==`sha256:${item.sha256}`))throw new Error(`远端附件校验失败：${item.name}`);}
+          JS
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
