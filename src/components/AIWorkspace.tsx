@@ -139,9 +139,9 @@ function MessageBody({ message }: { message: Message }) {
   return (
     <div className={`message ${message.role}`}>
       <div className="message-meta">
-        <span>{message.role === "user" ? "YOU" : "AGENT"}</span>
+        <span>{message.role === "user" ? "你" : "分析助手"}</span>
         <span>{new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</span>
-        {message.meta.mode && <span>{message.meta.mode.toUpperCase()}</span>}
+        {message.meta.mode && <span>{message.meta.mode === "analysis" ? "仅分析" : message.meta.mode === "debug" ? "调试模式" : message.meta.mode}</span>}
       </div>
       {refs.length > 0 && (
         <div className="message-refs">
@@ -502,7 +502,7 @@ export function AIWorkspace({
           {session.messages.length === 0 && !live && (
             <div className="agent-welcome">
               <div className="welcome-orbit"><Bot size={30} /></div>
-              <span className="eyebrow">EVIDENCE-FIRST CAPTURE AGENT</span>
+              <span className="eyebrow">基于证据的抓包分析</span>
               <h2>让每个结论都能回到原请求。</h2>
               <p>先固定批次、设备和时间范围，再让 Agent 分页检索、按字段读取、聚合与对比。默认只读，调试变更必须预览和审批。</p>
               <div className="prompt-examples">
@@ -531,7 +531,7 @@ export function AIWorkspace({
           {facts.length > 0 && (
             <div className="evidence-board">
               <div className="evidence-board-head">
-                <div><span className="eyebrow">EVIDENCE BOARD</span><h3>本轮引用</h3></div>
+                <div><span className="eyebrow">引用与证据</span><h3>本轮引用</h3></div>
                 <span>{facts.filter(item => item.state === "valid").length} 条有效 · {facts.filter(item => item.state !== "valid").length} 条失效</span>
               </div>
               <div className="evidence-grid">
@@ -563,7 +563,7 @@ export function AIWorkspace({
           {live && (
             <div className="live-message">
               <div className="message assistant">
-                <div className="message-meta"><span>AGENT</span><span>LIVE</span></div>
+                <div className="message-meta"><span>分析助手</span><span>实时输出</span></div>
                 <div className="message-copy">
                   {live.content ? <InlineText text={live.content} /> : <span className="thinking"><i /><i /><i /></span>}
                 </div>
@@ -576,7 +576,7 @@ export function AIWorkspace({
             <div className="approval-card" key={approval.approvalId}>
               <div className="approval-icon"><ShieldAlert size={18} /></div>
               <div className="approval-copy">
-                <span className="eyebrow">VERSIONED ACTION REQUIRES APPROVAL</span>
+                <span className="eyebrow">请审批本次变更</span>
                 <h3>{approval.summary}</h3>
                 <p>{approval.impact || "这会立即修改代理配置。"} {approval.restore || "已生效的修改不会因停止 Agent 自动撤销。"}</p>
                 {approval.configVersion && <code>配置版本 {approval.configVersion}</code>}
@@ -617,7 +617,7 @@ export function AIWorkspace({
               {refs.map((ref) => (
                 <span className="request-ref removable" key={ref.id}>
                   <b>{ref.method}</b> {ref.url ? hostOf(ref.url) : ref.id}
-                  <button onClick={() => onRefs(refs.filter((item) => item.id !== ref.id))}><X size={12} /></button>
+                  <button title="移除此引用" aria-label="移除此引用" onClick={() => onRefs(refs.filter((item) => item.id !== ref.id))}><X size={12} /></button>
                 </span>
               ))}
             </div>
@@ -700,7 +700,7 @@ export function AIWorkspace({
       {report && draftReport && (
         <div className="report-drawer">
           <div className="report-drawer-head">
-            <div><span className="eyebrow">REPORT DRAFT</span><input value={draftReport.title} onChange={(event) => setDraftReport({ ...draftReport, title: event.target.value })} /></div>
+            <div><span className="eyebrow">报告草稿</span><input value={draftReport.title} onChange={(event) => setDraftReport({ ...draftReport, title: event.target.value })} /></div>
             <div className="report-actions">
               <button title="复制 Markdown" onClick={() => void navigator.clipboard.writeText(draftReport.content)}><Copy size={14} /></button>
               <button title="导出 Markdown" onClick={() => void onExportReport(draftReport, "markdown")}><Download size={14} /></button>

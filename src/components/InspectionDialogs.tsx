@@ -51,7 +51,7 @@ export function ComparisonDialog({
     ? comparison.differences.filter((item) => showIgnored || !item.ignored)
     : [];
   return (
-    <Dialog open={open} title="请求字段对比" kicker="HEADER · QUERY · JSON POINTER" wide onClose={onClose}>
+    <Dialog open={open} title="请求字段对比" kicker="请求头、查询参数与字段路径" wide onClose={onClose}>
       {loading && <div className="dialog-loading"><LoaderCircle className="spin" size={16} /> 正在读取并脱敏对比字段…</div>}
       {!loading && comparison && (
         <>
@@ -136,7 +136,7 @@ export function ScenarioCompareDialog({
     setB(selectable[1]?.id || "");
   }, [open, scenarios]);
   return (
-    <Dialog open={open} title="成功 / 失败场景对比" kicker="SCENARIO PAIRING" wide onClose={onClose}>
+    <Dialog open={open} title="成功 / 失败场景对比" kicker="场景配对" wide onClose={onClose}>
       <div className="scenario-compare-controls">
         <label className="field"><span>场景 A</span><Select value={a} onChange={(event) => setA(event.target.value)}>{selectable.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.requestCount} 条</option>)}</Select></label>
         <GitCompareArrows size={18} />
@@ -157,7 +157,7 @@ export function ScenarioCompareDialog({
           <div className="run-table scenario-pair-table">
             {result.pairs.map((pair) => (
               <button className="run-table-row" key={`${pair.aId}-${pair.bId}`} onClick={() => onSelectRequest(pair.aId)}>
-                <span className="status-pill active">{pair.differenceCount} DIFF</span>
+                <span className="status-pill active">{pair.differenceCount} 差异</span>
                 <div><b>{pair.key}</b><span>{pair.aId} ↔ {pair.bId}</span></div>
                 <span>A {pair.comparison.a.status ?? "—"}</span>
                 <span>B {pair.comparison.b.status ?? "—"}</span>
@@ -204,7 +204,7 @@ export function AggregateDialog({
   onClose: () => void;
 }) {
   return (
-    <Dialog open={open} title="接口聚合与耗时" kicker="FAILURE RATE · P50 · P95" wide onClose={onClose}>
+    <Dialog open={open} title="接口聚合与耗时" kicker="失败率与耗时分位数" wide onClose={onClose}>
       <div className="aggregate-controls">
         <label className="field"><span>聚合维度</span><Select value={groupBy} onChange={(event) => onGroupBy(event.target.value)}>
           <option value="endpoint">接口</option>
@@ -226,12 +226,12 @@ export function AggregateDialog({
           <div className="aggregate-grid">
             {result.groups.slice(0, 200).map((group) => (
               <button className="aggregate-card" key={group.key} onClick={() => group.sampleIds[0] && onSelectRequest(group.sampleIds[0])}>
-                <div><b>{group.key}</b><span>{group.count} samples</span></div>
+                <div><b>{group.key}</b><span>{group.count} 样本</span></div>
                 <div className="aggregate-metrics">
-                  <span className={group.failureCount ? "bad" : "good"}>{(group.failureRate * 100).toFixed(1)}% fail</span>
+                  <span className={group.failureCount ? "bad" : "good"}>{(group.failureRate * 100).toFixed(1)}% 失败</span>
                   <span>P50 {formatDuration(group.p50Ms)}</span>
                   <span>P95 {formatDuration(group.p95Ms)}</span>
-                  <span>MAX {formatDuration(group.maxMs)}</span>
+                  <span>最大耗时 {formatDuration(group.maxMs)}</span>
                   <span className={`status-code ${(group.latestStatus || 0) >= 400 ? "bad" : "good"}`}>{group.latestStatus ?? "—"}</span>
                 </div>
               </button>
@@ -260,7 +260,7 @@ export function DuplicateDialog({
   onClose: () => void;
 }) {
   return (
-    <Dialog open={open} title="重复、轮询与重试候选" kicker="TEMPORAL PATTERN DETECTION" wide onClose={onClose}>
+    <Dialog open={open} title="重复、轮询与重试候选" kicker="请求时序模式" wide onClose={onClose}>
       <div className="aggregate-controls">
         <span className="muted small">按方法 + URL 做时间统计；不等同于确认业务重试。</span>
         <button className="button ghost compact" disabled={busy} onClick={() => void onLoad()}>
@@ -315,7 +315,7 @@ export function WaterfallDialog({
   }, [open, initialTraceId]);
   const services = useMemo(() => new Set(result?.entries.map((item) => item.serviceName) || []), [result]);
   return (
-    <Dialog open={open} title="跨服务调用瀑布" kicker="PROXY OBSERVED + IMPORTED SPANS" wide onClose={onClose}>
+    <Dialog open={open} title="跨服务调用瀑布" kicker="代理观测与导入链路" wide onClose={onClose}>
       <div className="waterfall-search">
         <label className="field"><span>W3C Trace ID</span><input value={traceId} onChange={(event) => setTraceId(event.target.value.trim())} placeholder="32 位十六进制 Trace ID" /></label>
         <button className="button primary compact self-end" disabled={!traceId || loading} onClick={() => void onLoad(traceId)}>
@@ -406,7 +406,7 @@ export function ChecklistDialog({
   onClose: () => void;
 }) {
   return (
-    <Dialog open={open} title="人工验证清单" kicker="QA VERIFICATION POINTS" wide onClose={onClose}>
+    <Dialog open={open} title="人工验证清单" kicker="人工验证要点" wide onClose={onClose}>
       {loading && <div className="dialog-loading"><LoaderCircle className="spin" size={16} /> 正在整理事实与验证步骤…</div>}
       {result && (
         <>

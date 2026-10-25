@@ -9,7 +9,8 @@ import sys
 
 root = Path(__file__).resolve().parent.parent
 output = Path(sys.argv[1])
-notices = ["# Distribution dependency notices\n", "Generated from installed packages and the locked Cargo graph. Includes build tools conservatively; their presence does not imply they are bundled. Missing license texts need maintainer review before redistribution.\n"]
+notices = ["# 分发依赖与许可证声明\n", "根据已安装的锁定依赖与当前 Cargo 目标图生成，保守列入构建工具；列入不代表全部打包。许可证及上游原文保持原语言。标准条款模板不替代上游署名，作者及原有声明另行保留。缺失文本须在再分发前核查。\n"]
+source_locations = ["# 第三方依赖源码获取\n", "以下为锁定版本的上游源码位置。项目未修改这些依赖；保留其原有许可证。标准MIT文本中的占位署名不用于替代上游作者，具体归属见依赖声明中的包署名和源码。\n"]
 missing = []
 supplements = json.loads((root/'third-party/license-sources.json').read_text())
 
@@ -18,7 +19,16 @@ def license_files(folder):
     return [p for p in folder.iterdir() if p.is_file() and re.match(r"^(licen[sc]e|copying|notice)([.\-_]|$)", p.name, re.I)]
 
 def add(ecosystem, name, version, expression, texts):
-    notices.append(f"\n## {ecosystem}: {name} {version}\n\nDeclared license: {expression or 'not declared'}\n")
+    notices.append(f"\n## {ecosystem}: {name} {version}\n\n声明许可：{expression or '未声明'}\n")
+    if ecosystem == 'Cargo':
+        source_url = f'https://crates.io/api/v1/crates/{name}/{version}/download'
+    elif ecosystem == 'Python':
+        source_url = f'https://pypi.org/project/{name}/{version}/#files'
+    elif ecosystem == 'npm':
+        source_url = f'https://registry.npmjs.org/{name}/-/{name.split("/")[-1]}-{version}.tgz'
+    else:
+        source_url = f'https://www.python.org/downloads/release/python-{version.replace(".", "")}/'
+    source_locations.append(f'- {ecosystem} `{name} {version}`：{source_url}（{expression or "许可未声明"}）')
     for record in supplements:
         if (record['ecosystem'], record['name'], record['version']) != (ecosystem, name, version):
             continue
@@ -27,8 +37,10 @@ def add(ecosystem, name, version, expression, texts):
             raise ValueError(f'License supplement checksum mismatch: {source}')
         text = source.read_text()
         notices.append(f"\nUpstream supplement: {record['source']}\n")
+        if record.get('selectedLicense'):
+            notices.append(f"\n本次选择的许可：{record['selectedLicense']}。上游包署名：{', '.join(record.get('upstreamAuthors', [])) or '见原始源码'}。原始包源码：{record['packageSource']}\n")
         # An upstream overview can be useful but is not a complete license grant.
-        if 'Permission is hereby granted' in text or 'Redistribution and use' in text:
+        if 'Permission is hereby granted' in text or 'Redistribution and use' in text or (record.get('canonicalText') and record.get('selectedLicense') == 'MPL-2.0' and 'Mozilla Public License' in text):
             texts.append((record['file'], text))
         else:
             notices.append('\n' + text)
@@ -79,5 +91,6 @@ runtime_license = Path(sysconfig.get_path('stdlib'))/'LICENSE.txt'
 add('runtime', 'CPython', sys.version.split()[0], 'Python-2.0', [('LICENSE.txt', runtime_license.read_text())] if runtime_license.exists() else [])
 output.mkdir(parents=True, exist_ok=True)
 (output/'DEPENDENCY-NOTICES.md').write_text('\n'.join(notices))
+(output/'SOURCE-LOCATIONS.md').write_text('\n'.join(source_locations)+'\n')
 (output/'license-review.json').write_text(json.dumps(missing, indent=2)+'\n')
 print(f'Collected dependency notices; {len(missing)} packages need license-text review (see license-review.json).')

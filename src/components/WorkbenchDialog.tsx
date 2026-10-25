@@ -358,7 +358,7 @@ export function WorkbenchDialog({
   );
 
   return (
-    <Dialog open={open} keepMounted title="QA 工作台" kicker="ENVIRONMENT · IMPORTS · INTEGRATIONS · ACTIONS" wide onClose={onClose}>
+    <Dialog open={open} keepMounted title="QA 工作台" kicker="环境、数据交换、连接与操作" wide onClose={onClose}>
       <div className="workbench-layout">
         <nav className="workbench-nav">
           <button className={tab === "qa" ? "active" : ""} onClick={() => setTab("qa")}><Check size={15} /> QA 场景</button>
@@ -378,7 +378,7 @@ export function WorkbenchDialog({
           {tab === "projects" && <ProjectWorkspace />}
           {tab === "environments" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">ENVIRONMENT PROFILE</span><h3>项目环境</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">环境配置</span><h3>项目环境</h3></div></div>
               <div className="form-grid two">
                 <label className="field"><span>环境名称</span><input value={environment.name} onChange={(event) => setEnvironment({ ...environment, name: event.target.value })} placeholder="测试环境 / iOS QA" /></label>
                 <label className="field"><span>App 版本</span><input value={environment.appVersion} onChange={(event) => setEnvironment({ ...environment, appVersion: event.target.value })} placeholder="5.8.0" /></label>
@@ -402,7 +402,7 @@ export function WorkbenchDialog({
 
           {tab === "business" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">BUSINESS SUCCESS SEMANTICS</span><h3>业务码与错误字段</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">业务成功判定</span><h3>业务码与错误字段</h3></div></div>
               <div className="form-grid two">
                 <label className="field"><span>规则名称</span><input value={business.name} onChange={(event) => setBusiness({ ...business, name: event.target.value })} /></label>
                 <label className="field"><span>Host 正则</span><input value={business.hostPattern} onChange={(event) => setBusiness({ ...business, hostPattern: event.target.value })} placeholder="api\\.example\\.com" /></label>
@@ -435,7 +435,7 @@ export function WorkbenchDialog({
 
           {tab === "associations" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">RELATION SEMANTICS</span><h3>关联与动态字段</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">关联判定</span><h3>关联与动态字段</h3></div></div>
               <div className="config-card">
                 <label className="field"><span>业务关联规则名称</span><input value={association.name} onChange={(event) => setAssociation({ ...association, name: event.target.value })} placeholder="订单 ID 关联" /></label>
                 <label className="field"><span>字段名</span><input value={association.field} onChange={(event) => setAssociation({ ...association, field: event.target.value })} /></label>
@@ -460,7 +460,7 @@ export function WorkbenchDialog({
           {tab === "imports" && (
             <>
               <div className="settings-heading">
-                <div><span className="eyebrow">INTEROPERABILITY</span><h3>导入与导出</h3></div>
+                <div><span className="eyebrow">数据交换</span><h3>导入与导出</h3></div>
                 <button className="button ghost compact" onClick={async () => {
                   if (!beginOperation()) return;
                   try {
@@ -498,18 +498,18 @@ export function WorkbenchDialog({
                 {imports.map((item) => (
                   <div className="config-row" key={item.id}>
                     <div><b>{item.kind}</b><span>{item.source || "本地导入"} · {JSON.stringify(item.summary)}</span></div>
-                    <span className="status-pill active">IMPORTED</span>
+                    <span className="status-pill active">已导入</span>
                   </div>
                 ))}
               </div>
               {openApiTemplates.length > 0 && (
                 <div className="template-list">
-                  <div className="section-heading"><h3>Path Templates</h3><span>{openApiTemplates.filter((item) => item.openapi).length} matched</span></div>
+                  <div className="section-heading"><h3>路径模板</h3><span>{openApiTemplates.filter((item) => item.openapi).length} 已匹配</span></div>
                   {openApiTemplates.map((item) => (
                     <div className="template-row" key={String(item.endpoint)}>
                       <code>{String(item.endpoint)}</code>
                       <span className={item.openapi ? "status-pill active" : "status-pill"}>
-                        {item.openapi?.template || "NO CONTRACT"}
+                        {item.openapi?.template || "未选契约"}
                       </span>
                       {item.openapi?.operationId && <small>{item.openapi.operationId}</small>}
                     </div>
@@ -521,12 +521,12 @@ export function WorkbenchDialog({
 
           {tab === "integrations" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">CONTROLLED INTEGRATIONS</span><h3>MCP、观测平台与工单</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">受控连接</span><h3>MCP、观测平台与工单</h3></div></div>
               <div className="config-card">
                 <b>MCP 白名单</b>
                 <div className="form-grid three">
                   <label className="field"><span>名称</span><input value={mcp.name} onChange={(event) => setMcp({ ...mcp, name: event.target.value })} /></label>
-                  <label className="field"><span>Endpoint</span><input value={mcp.endpoint} onChange={(event) => setMcp({ ...mcp, endpoint: event.target.value })} placeholder="https://…/mcp" /></label>
+                  <label className="field"><span>服务地址</span><input value={mcp.endpoint} onChange={(event) => setMcp({ ...mcp, endpoint: event.target.value })} placeholder="https://…/mcp" /></label>
                   <label className="field"><span>允许工具（逗号）</span><input value={mcp.allowedTools} onChange={(event) => setMcp({ ...mcp, allowedTools: event.target.value })} /></label>
                 </div>
                 <button className="button primary compact" disabled={busy || !mcp.name || !mcp.endpoint} onClick={() => void performOperation(async () => {
@@ -595,7 +595,7 @@ export function WorkbenchDialog({
 
           {tab === "debug" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">PREVIEW · APPROVAL · RESTORE</span><h3>调试变更</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">预览、审批与恢复</span><h3>调试变更</h3></div></div>
               <div className="form-grid two">
                 <label className="field"><span>操作类型</span><Select value={debugType} onChange={(event) => {
                   setDebugType(event.target.value);
@@ -609,7 +609,7 @@ export function WorkbenchDialog({
                           ? '{\n  "source": "https://api.example.com/v1/*",\n  "phase": "request",\n  "part": "header",\n  "action": "set",\n  "headerName": "X-QA",\n  "headerValue": "1"\n}'
                           : '{\n  "source": "https://api.example.com/v1/*",\n  "target": "http://127.0.0.1:3000/v1/"\n}'
                   );
-                }}><option value="map-remote">Map Remote</option><option value="map-local">Map Local</option><option value="rewrite">Rewrite</option><option value="throttle">弱网</option></Select></label>
+                }}><option value="map-remote">远端映射</option><option value="map-local">本地映射</option><option value="rewrite">内容改写</option><option value="throttle">弱网</option></Select></label>
                 <button className="button ghost compact self-end" onClick={() => void previewDebug()} disabled={busy}><RefreshCw size={13} /> 生成预览</button>
               </div>
               {debugType === "map-local" && <div className="form-grid two"><label className="field"><span>文件授权会话</span><Select value={sharedSessionId} onChange={event => { setSharedSessionId(event.target.value); setDebugAction(null); setDebugVerification(null); }}>{sharedSessions.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</Select></label><button className="button ghost compact" disabled={!sharedSessionId || busy} onClick={() => void shareMockFile()}>选择并共享 Mock 文件</button></div>}
@@ -681,7 +681,7 @@ export function WorkbenchDialog({
 
           {tab === "runs" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">PERSISTED RUNS</span><h3>执行记录</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">已保存的执行记录</span><h3>执行记录</h3></div></div>
               <PerformancePanel runs={runs} />
               <div className="config-card">
                 <b>Agent 默认预算</b>
@@ -711,8 +711,8 @@ export function WorkbenchDialog({
                     <span className={`run-status ${run.status}`}>{run.status}</span>
                     <div><b>{run.scope.batchLabel || run.batchId}</b><span>{run.id} · {run.mode}</span></div>
                     <span>{run.scope.requestCount} 样本</span>
-                    <span>{run.usage.totalTokens || 0} tokens</span>
-                    <span>{run.usage.toolCalls || 0} tools</span>
+                    <span>{run.usage.totalTokens || 0} 词元</span>
+                    <span>{run.usage.toolCalls || 0} 工具调用</span>
                     <time>{new Date(run.createdAt).toLocaleString("zh-CN")}</time>
                   </button>
                 ))}

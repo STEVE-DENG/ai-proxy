@@ -1,8 +1,8 @@
 {
   "name": "ai-proxy",
   "private": true,
-  "version": "0.2.0",
-  "description": "Local HTTP(S) capture and AI-assisted QA workbench for macOS",
+  "version": "0.2.1",
+  "description": "面向 macOS 的本地抓包、AI 分析与接口验证工作台",
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "AI Proxy",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.nekoya.ai-proxy",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AI Proxy",
+        "title": "AI 抓包助手",
         "width": 1440,
         "height": 900,
         "minWidth": 760,
@@ -34,15 +34,16 @@
       "app"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "Local capture proxy with an AI debugging agent",
-    "longDescription": "A local macOS HTTP(S) debugging proxy with traffic inspection, mapping, rewrite, throttling and an AI agent.",
+    "shortDescription": "本地抓包、AI 分析与接口验证工作台",
+    "longDescription": "面向 macOS 的本地 HTTP(S) 抓包工具，支持请求查看、映射改写、弱网模拟、AI 证据分析与接口复现。",
     "externalBin": [
       "binaries/ai-proxy-engine"
     ],
     "macOS": {
       "signingIdentity": "-",
       "hardenedRuntime": false,
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "infoPlist": "Info.plist"
     },
     "icon": [
       "icons/32x32.png",

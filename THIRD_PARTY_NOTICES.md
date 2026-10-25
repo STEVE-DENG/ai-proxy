@@ -57,3 +57,9 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## 0.2.1 分发补充
+
+`third-party/license-sources.json`保存按包名和锁定版本匹配的上游来源、标准许可文本、作者归属及SHA-256。objc2系列保留上游许可概述，并另附MIT标准条款及Cargo元数据中的作者；多许可包本次选择MIT。selectors补附MPL-2.0标准条款。标准文本中的占位署名不是新增版权归属，具体归属以原始包源码与原有声明为准。许可原文不翻译，避免改变条款含义。
+
+发行包的`notices/DEPENDENCY-NOTICES.md`收集原始声明，`notices/SOURCE-LOCATIONS.md`列出锁定版本的上游源码位置。本轮收集器的缺失许可文本清单为零，表示已补齐其发现的文本缺口，不代表完整法律审计或自动确认一切再分发义务。

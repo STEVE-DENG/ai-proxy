@@ -25,3 +25,9 @@ Use case: background-extraction. Edit target: the supplied AI Proxy application 
 ```text
 Use case: ads-marketing. Asset type: wide 3:1 open-source README illustration for AI Proxy, a local HTTP(S) capture and AI debugging desktop workbench. Primary request: a precise and restrained editorial technical illustration of a request traveling from a smartphone and desktop, through a central forest-green local capture instrument, into a small row of organized request records and an evidence document. Simple ivory surfaces, forest green outlines and a small copper packet node, on a clean neutral light background. Strong geometry, horizontal left-to-right flow, generous negative space, carefully spaced diagram-like objects. Include subtle dark-green panel within the capture instrument so it harmonizes with both the light and dark UI. No words, letters, numbers, logos, robot, brain, chat bubbles, watermark, photographic screens or fake screenshots. This is a conceptual product illustration, not a screenshot or a claim that a real connection succeeded.
 ```
+
+## 0.2.1 图标更新
+
+按用户最新要求，当前应用图标**不含中文或其他文字**。颜色改为浅薄荷绿底、柔和玉绿色网络符号和浅桃色节点，透明外角保留。使用内置`image_gen`编辑原图；旧深绿与带文字候选均不用于0.2.1。`app-icon-source.png`和应用、macOS图标资源同步更新；架构SVG所有说明改为中文。
+
+当前图标编辑要求：保持原网络路由与抓包窗口符号，背景改为浅薄荷绿（参考`#DCEDE5`、`#B9D8CA`），符号为柔和玉绿（`#4D8672`），节点为浅桃色（`#E3B79D`）；不添加文字、字母、数字或新物体，清理圆角方块外的杂点并保留真实透明像素。仅改变图标，示意插图仍为概念图，不作为运行截图。

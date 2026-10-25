@@ -209,13 +209,13 @@ export function RulesDialog({ open, rules, draft, onClose, onChanged }: RulesDia
   };
 
   return (
-    <Dialog open={open} title="规则工作台" kicker="MAP & REWRITE" wide onClose={onClose}>
+    <Dialog open={open} title="规则工作台" kicker="映射与改写" wide onClose={onClose}>
       <div className="rules-layout">
         <aside className="rules-list-pane">
           <div className="segmented">
             {(["local", "remote", "rewrite"] as RuleType[]).map((type) => (
               <button key={type} className={tab === type ? "active" : ""} onClick={() => { setTab(type); setEditId(null); setForm({ ...emptyForm, source: draft?.source ?? "" }); }}>
-                {type === "local" ? "Local" : type === "remote" ? "Remote" : "Rewrite"}
+                {type === "local" ? "Local" : type === "remote" ? "Remote" : "内容改写"}
               </button>
             ))}
           </div>
@@ -242,7 +242,7 @@ export function RulesDialog({ open, rules, draft, onClose, onChanged }: RulesDia
         <div className="rule-editor">
           <div className="editor-head">
             <div>
-              <span className="eyebrow">{editId ? "EDIT RULE" : "NEW RULE"}</span>
+              <span className="eyebrow">{editId ? "编辑规则" : "新建规则"}</span>
               <h3>{ruleLabel(tab)}</h3>
             </div>
             {editId && <button className="button ghost compact" onClick={() => { setEditId(null); setForm({ ...emptyForm, source: draft?.source ?? "" }); }}><Plus size={13} /> 新建</button>}
@@ -258,7 +258,7 @@ export function RulesDialog({ open, rules, draft, onClose, onChanged }: RulesDia
             <>
               <div className="form-grid two">
                 <label className="field"><span>阶段</span><Select value={form.phase} onChange={(event) => setForm({ ...form, phase: event.target.value as RulePhase })}><option value="request">请求</option><option value="response">响应</option></Select></label>
-                <label className="field"><span>位置</span><Select value={form.part} onChange={(event) => setForm({ ...form, part: event.target.value as RulePart })}><option value="header">Header</option><option value="body">Body</option></Select></label>
+                <label className="field"><span>位置</span><Select value={form.part} onChange={(event) => setForm({ ...form, part: event.target.value as RulePart })}><option value="header">请求头</option><option value="body">正文</option></Select></label>
               </div>
               {form.part === "header" ? (
                 <>
@@ -316,7 +316,7 @@ export function ThrottleDialog({ open, value, onClose, onSave }: ThrottleDialogP
     }
   };
   return (
-    <Dialog open={open} title="代理弱网" kicker="NETWORK SHAPING" onClose={onClose}>
+    <Dialog open={open} title="代理弱网" kicker="网络条件模拟" onClose={onClose}>
       <div className="preset-row">{PRESETS.map((preset) => (
         <button
           className={`preset ${state.upKbPerSecond === preset.up && state.downKbPerSecond === preset.down && state.latencyMs === preset.latency ? "active" : ""}`}
@@ -414,7 +414,7 @@ export function PhoneDialog({ open, capture, certificate, onClose, onLan, onHttp
   };
   const pair = () => act(async () => { await call("connections.pair"); setPolling(true); });
   const verified = (value: {at: number; address: string} | null | undefined) => activePair && value ? `已验证 · ${value.address} · ${new Date(value.at).toLocaleTimeString()}` : "尚未验证";
-  return <Dialog open={open} title="连接手机与诊断" kicker="LAN CAPTURE" wide onClose={onClose}>
+  return <Dialog open={open} title="连接手机与诊断" kicker="局域网抓包" wide onClose={onClose}>
     {error && <div className="error-banner" role="alert">{error}<button className="button ghost compact" onClick={() => void act(refresh)}>重新检查</button></div>}
     <div className="phone-layout">
       <div className="phone-visual">
@@ -655,7 +655,7 @@ export function SettingsDialog({
   };
 
   return (
-    <Dialog open={open} title="设置" kicker="AI PROXY CONFIGURATION" wide onClose={onClose}>
+    <Dialog open={open} title="设置" kicker="应用配置" wide onClose={onClose}>
       <div className="settings-layout">
         <nav className="settings-nav">
           <button className={tab === "providers" ? "active" : ""} onClick={() => setTab("providers")}><KeyRound size={15} /> 供应商</button>
@@ -667,7 +667,7 @@ export function SettingsDialog({
         <fieldset className="settings-content task-fields" disabled={busy}>
           {tab === "providers" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">MODEL PROVIDERS</span><h3>供应商</h3></div><button className="button primary compact" onClick={beginNew}><Plus size={14} /> 添加</button></div>
+              <div className="settings-heading"><div><span className="eyebrow">模型供应商</span><h3>供应商</h3></div><button className="button primary compact" onClick={beginNew}><Plus size={14} /> 添加</button></div>
               <div className="provider-list">
                 {providers.length === 0 ? <div className="empty-detail">尚未配置供应商。抓包功能不需要供应商即可使用。</div> : providers.map((provider) => (
                   <button className={`provider-row ${selectedProviderId === provider.id ? "active" : ""}`} key={provider.id} onClick={() => { onProvider(provider.id); void beginEdit(provider); }}>
@@ -686,10 +686,10 @@ export function SettingsDialog({
                     <label className="field"><span>显示名称</span><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="OpenAI" /></label>
                     <label className="field"><span>协议</span><Select value={form.protocol} onChange={(event) => { const protocol = event.target.value as ProviderForm["protocol"]; setForm({ ...form, protocol, baseUrl: officialBase(protocol) }); }}><option value="openai-responses">OpenAI Responses</option><option value="openai-chat">OpenAI Chat Completions</option><option value="anthropic">Anthropic Messages</option></Select></label>
                   </div>
-                  <label className="field"><span>Base URL</span><input value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} placeholder={officialBase(form.protocol)} /></label>
+                  <label className="field"><span>服务基础地址</span><input value={form.baseUrl} onChange={(event) => setForm({ ...form, baseUrl: event.target.value })} placeholder={officialBase(form.protocol)} /></label>
                   <div className="form-grid two">
                     <label className="field"><span>模型 ID</span><input value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} placeholder="手动填写供应商模型名" /></label>
-                    <label className="field"><span>API Key</span><input type={showInputKey ? "text" : "password"} value={form.apiKey} autoComplete="new-password" onChange={(event) => { setReplaceKey(true); setForm({ ...form, apiKey: event.target.value }); }} placeholder={form.id ? "留空保持已保存的 Key" : "本机服务可留空"} /><button type="button" className="button ghost compact" onClick={() => setShowInputKey(value => !value)}>{showInputKey ? "隐藏输入" : "显示输入"}</button></label>
+                    <label className="field"><span>接口密钥</span><input type={showInputKey ? "text" : "password"} value={form.apiKey} autoComplete="new-password" onChange={(event) => { setReplaceKey(true); setForm({ ...form, apiKey: event.target.value }); }} placeholder={form.id ? "留空保持已保存的 Key" : "本机服务可留空"} /><button type="button" className="button ghost compact" onClick={() => setShowInputKey(value => !value)}>{showInputKey ? "隐藏输入" : "显示输入"}</button></label>
                   </div>
                   {form.id && <label className="switch-row compact"><div><b>替换或清空已保存的密钥</b><span>开启后保存空值可用于本机无密钥服务；关闭且留空时保留原密钥。</span></div><input type="checkbox" checked={replaceKey} onChange={event => setReplaceKey(event.target.checked)} /></label>}
                   <label className="field"><span>供应商缓存策略</span><Select value={form.cachePolicy || "auto"} onChange={event => setForm({ ...form, cachePolicy: event.target.value as Provider["cachePolicy"] })}><option value="auto">自动（官方端点启用，兼容端点不发扩展）</option><option value="enabled">显式启用（确认兼容端点支持）</option><option value="off">不发送缓存扩展参数</option></Select><small>不支持缓存参数时选择关闭。不会在失败后自动重复请求模型。</small></label>
@@ -709,7 +709,7 @@ export function SettingsDialog({
 
           {tab === "capture" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">PROXY LISTENER</span><h3>抓包与代理</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">代理监听</span><h3>抓包与代理</h3></div></div>
               <CaptureTimeoutPanel capture={capture} onChanged={onPortSaved} />
               <div className="settings-card">
                 <div className="settings-card-row"><div><b>监听端口</b><span>{capture.running ? "请先停止代理，再修改监听端口。" : "修改后会在下次启动抓包时生效。"}</span></div><div className="inline-edit"><input type="number" disabled={capture.running} value={port} onChange={(event) => setPort(Number(event.target.value))} /><button className="button ghost compact" disabled={capture.running} onClick={() => void performSetting(async () => { await call("app.set-port", { port }); setMessage("监听端口已有保存回执，正在刷新状态。"); await onPortSaved(); setMessage("监听端口已保存。"); })}>保存</button></div></div>
@@ -722,7 +722,7 @@ export function SettingsDialog({
 
           {tab === "cert" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">CERTIFICATE AUTHORITY</span><h3>证书</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">证书信任</span><h3>证书</h3></div></div>
               <div className="cert-card"><ShieldCheck size={24} /><div><b>{certificate.exists ? "本机 CA 已生成" : "启动代理后生成 CA"}</b><code>{certificate.path}</code><span>手机访问 {certificate.url} 安装。HTTPS 可由抓包页或连接手机页一键开启；设备必须信任 CA。</span></div></div>
               <div className="settings-note"><Smartphone size={14} /><span>iOS 安装后还需要在证书信任设置中手动开启完全信任。不要把 CA 私钥发给其他人。</span></div>
             </>
@@ -730,7 +730,7 @@ export function SettingsDialog({
 
           {tab === "storage" && (
             <>
-              <div className="settings-heading"><div><span className="eyebrow">LOCAL DATA</span><h3>存储</h3></div></div>
+              <div className="settings-heading"><div><span className="eyebrow">本地数据</span><h3>存储</h3></div></div>
               <StorageHealthPanel />
               <div className="settings-card">
                 <div className="settings-card-row"><div><b>数据目录</b><span className="path-line">{storage.dataDir}</span></div><b className="mono">{formatBytes(storage.size)}</b></div>

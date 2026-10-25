@@ -1216,14 +1216,14 @@ export function CaptureWorkspace({
                 setScenarioName("");
                 setScenarioOpen(false);
               }}>开始记录</button>
-              <button className="icon-action small" onClick={() => setScenarioOpen(false)}><X size={14} /></button>
+              <button className="icon-action small" title="关闭场景设置" aria-label="关闭场景设置" onClick={() => setScenarioOpen(false)}><X size={14} /></button>
             </>
           )}
         </div>
       )}
 
       <section className="filterbar">
-        <div className="filter-search"><Search size={14} /><input value={filters.query} placeholder="URL / Host / Path" onChange={(event) => onFilters({ ...filters, query: event.target.value })} /></div>
+        <div className="filter-search"><Search size={14} /><input value={filters.query} placeholder="网址 / 主机 / 路径" onChange={(event) => onFilters({ ...filters, query: event.target.value })} /></div>
         <div className="filter-select"><Filter size={13} /><Select value={filters.method} onChange={(event) => onFilters({ ...filters, method: event.target.value })}><option value="">全部方法</option><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>CONNECT</option></Select></div>
         <div className="filter-select"><Select value={filters.status} onChange={(event) => onFilters({ ...filters, status: event.target.value })}><option value="">全部状态</option><option value="2xx">2xx</option><option value="3xx">3xx</option><option value="4xx">4xx</option><option value="5xx">5xx</option></Select></div>
         <div className="filter-select"><Select value={filters.host} onChange={(event) => onFilters({ ...filters, host: event.target.value })}><option value="">全部 Host</option>{filterOptions.hosts.map((host) => <option key={host}>{host}</option>)}</Select></div>
@@ -1321,7 +1321,7 @@ export function CaptureWorkspace({
         <aside className="request-tree" onKeyDown={onKeyDown} tabIndex={0}>
           <PanelResize name="调整请求树宽度" variable="--tree-width" initial={36} />
           <div className="tree-head">
-            <span>{uiState.view === "structure" ? "HOST / 请求" : uiState.view === "directories" ? "HOST / 目录 / 请求" : uiState.view === "timeline" ? "TIMELINE" : "RELATIONS"}</span>
+            <span>{uiState.view === "structure" ? "主机 / 请求" : uiState.view === "directories" ? "主机 / 目录 / 请求" : uiState.view === "timeline" ? "时间顺序" : "关联请求"}</span>
             <span>{requestPage.matchCount}</span>
           </div>
           <div
@@ -1466,7 +1466,7 @@ export function CaptureWorkspace({
           {!selected ? (
             <div className="detail-placeholder">
               <div className="detail-grid-mark" />
-              <div className="eyebrow">REQUEST INSPECTOR</div>
+              <div className="eyebrow">请求详情</div>
               <h2>选择一条请求查看细节</h2>
               <p>支持多选、字段证据跳转、成功/失败对比和就地 AI 分析。</p>
               <button className="button ghost compact" onClick={onInlineOpen}><Sparkles size={13} /> 打开就地 AI 面板</button>
@@ -1483,12 +1483,12 @@ export function CaptureWorkspace({
                   <div className="request-head-actions">
                     <button className="button ghost compact" onClick={() => onAddToAI(selected)}><Bot size={14} /> 附加</button>
                     <button className="button ghost compact" onClick={() => void analyze(`分析这条请求为什么异常，先读取状态、规则影响、Header 和必要正文，再给出证据。`)}><Sparkles size={14} /> 分析</button>
-                    <button className="button ghost compact" onClick={() => onRule("local", selected.url)}>Map Local</button>
+                    <button className="button ghost compact" onClick={() => onRule("local", selected.url)}>本地映射</button>
                     <button className="button ghost compact" onClick={() => onOpenWorkbench("debug")}>预览变更</button>
                   </div>
                 </div>
                 <div className="request-facts">
-                  <span className={`status-fact ${statusTone(selected.status)} ${activeLocator?.kind === "status" ? "evidence-target" : ""}`}>{selected.status || "—"} {selected.status ? "STATUS" : ""}</span>
+                  <span className={`status-fact ${statusTone(selected.status)} ${activeLocator?.kind === "status" ? "evidence-target" : ""}`}>{selected.status || "—"} {selected.status ? "状态" : ""}</span>
                   <span><Clock3 size={12} /> {formatDuration(selected.durationMs)}</span>
                   <span><Database size={12} /> {formatBytes(selected.size)}</span>
                   <span><Wifi size={12} /> {selected.sourceIp || "本机"}</span>
@@ -1523,7 +1523,7 @@ export function CaptureWorkspace({
                 {!detailLoading && !detail && <div className="empty-detail">详情读取失败</div>}
                 {detail && activeEvidence && (
                   <div className="evidence-focus-banner" key={activeEvidence.nonce}>
-                    <span>EVIDENCE LOCATOR</span>
+                    <span>证据位置</span>
                     <code>{activeEvidence.locator || activeEvidence.direction}</code>
                     <small>请求 v{detail.version}{activeEvidence.expectedVersion && activeEvidence.expectedVersion !== detail.version ? `（来源 v${activeEvidence.expectedVersion} 已失效，当前内容仅供参考）` : ""}；正文证据单独读取脱敏字段或分段；缺失与截断会明确显示。</small>
                   </div>
@@ -1531,7 +1531,7 @@ export function CaptureWorkspace({
                 {detail && uiState.detailTab === "overview" && (
                   <div className="overview-grid">
                     <section className="overview-block full">
-                      <div className="block-head"><span>GENERAL</span><small>{detail.environment || "未设置环境"}</small></div>
+                      <div className="block-head"><span>概要</span><small>{detail.environment || "未设置环境"}</small></div>
                       <dl className="fact-list">
                         <dt>请求 URL</dt><dd className="break"><QueryHighlight url={detail.url} queryKey={activeQueryKey} /></dd>
                         <dt>实际上游</dt><dd className="break">{detail.actualUrl || detail.url}</dd>
@@ -1544,16 +1544,16 @@ export function CaptureWorkspace({
                       </dl>
                     </section>
                     <section className="overview-block">
-                      <div className="block-head"><span>REQUEST</span><small>{formatBytes(detail.requestBodySize)}</small></div>
+                      <div className="block-head"><span>请求</span><small>{formatBytes(detail.requestBodySize)}</small></div>
                       <div className="mini-code">{detail.requestBodyText ? detail.requestBodyText.slice(0, 900) : "无可用正文"}</div>
                     </section>
                     <section className="overview-block">
-                      <div className="block-head"><span>RESPONSE</span><small>{formatBytes(detail.responseBodySize)}</small></div>
+                      <div className="block-head"><span>响应</span><small>{formatBytes(detail.responseBodySize)}</small></div>
                       <div className="mini-code">{detail.responseBodyText ? detail.responseBodyText.slice(0, 900) : "无可用正文"}</div>
                     </section>
                     {selectedEvidence.length > 0 && (
                       <section className="overview-block full evidence-mini-list">
-                        <div className="block-head"><span>EVIDENCE IN CURRENT RUN</span></div>
+                        <div className="block-head"><span>当前分析中的证据</span></div>
                         {selectedEvidence.map((item) => (
                           <button key={item.id} onClick={() => onEvidenceSelect(item.requestId, item.direction, item.locator)}>
                             <span>{item.summary}</span><code>{item.locator}</code>
@@ -1565,13 +1565,13 @@ export function CaptureWorkspace({
                 )}
                 {detail && uiState.detailTab === "request" && (
                   <div className="detail-section">
-                    <div className="section-heading"><h3>Request Headers</h3><span>{detail.requestHeaders.length}</span></div>
+                    <div className="section-heading"><h3>请求头</h3><span>{detail.requestHeaders.length}</span></div>
                     <HeadersTable
                       headers={detail.requestHeaders}
                       highlightedName={activeDirection === "request" ? activeHeaderName : null}
                       evidenceNonce={activeEvidence?.nonce}
                     />
-                    <div className="section-heading spaced"><h3>Request Body</h3><BodyStateBadge state={detail.bodyStates.request} /></div>
+                    <div className="section-heading spaced"><h3>请求正文</h3><BodyStateBadge state={detail.bodyStates.request} /></div>
                     <BodyPanel
                       key={`${detail.id}:${detail.version}:request`}
                       requestId={detail.id}
@@ -1586,13 +1586,13 @@ export function CaptureWorkspace({
                 )}
                 {detail && uiState.detailTab === "response" && (
                   <div className="detail-section">
-                    <div className="section-heading"><h3>Response Headers</h3><span>{detail.responseHeaders.length}</span></div>
+                    <div className="section-heading"><h3>响应头</h3><span>{detail.responseHeaders.length}</span></div>
                     <HeadersTable
                       headers={detail.responseHeaders}
                       highlightedName={activeDirection === "response" ? activeHeaderName : null}
                       evidenceNonce={activeEvidence?.nonce}
                     />
-                    <div className="section-heading spaced"><h3>Response Body</h3><BodyStateBadge state={detail.bodyStates.response} /></div>
+                    <div className="section-heading spaced"><h3>响应正文</h3><BodyStateBadge state={detail.bodyStates.response} /></div>
                     <BodyPanel
                       key={`${detail.id}:${detail.version}:response`}
                       requestId={detail.id}
@@ -1607,7 +1607,7 @@ export function CaptureWorkspace({
                 )}
                 {detail && uiState.detailTab === "timing" && (
                   <div className="timing-panel">
-                    <div className="timing-hero"><span>{formatDuration(detail.durationMs)}</span><small>PROXY OBSERVED</small></div>
+                    <div className="timing-hero"><span>{formatDuration(detail.durationMs)}</span><small>代理观测</small></div>
                     <div className="timing-track"><div className="timing-fill" style={{ width: "100%" }} /></div>
                     <div className="timing-grid">
                       <div><span>开始</span><b>{formatTime(detail.startedAt)}</b></div>
@@ -1625,7 +1625,7 @@ export function CaptureWorkspace({
                 {detail && uiState.detailTab === "rules" && (
                   <div className="rule-impact-panel">
                     <section>
-                      <div className="section-heading"><h3>Matched Rule</h3></div>
+                      <div className="section-heading"><h3>命中规则</h3></div>
                       <pre>{JSON.stringify(detail.ruleEvidence || {}, null, 2)}</pre>
                     </section>
                     <div className="rule-impact-note">
@@ -1636,7 +1636,7 @@ export function CaptureWorkspace({
                 )}
                 {detail && uiState.detailTab === "relations" && (
                   <div className="detail-relations">
-                    <div className="section-heading"><h3>Relations</h3><button className="link-button" onClick={() => void onLoadRelations()}>刷新</button></div>
+                    <div className="section-heading"><h3>关联请求</h3><button className="link-button" onClick={() => void onLoadRelations()}>刷新</button></div>
                     {!relations ? <div className="empty-detail">正在读取关系…</div> : (
                       <>
                         {relations.edges.filter((edge) => edge.sourceId === detail.id || edge.targetId === detail.id).map((edge, index) => (
@@ -1667,7 +1667,7 @@ export function CaptureWorkspace({
           <aside ref={inlinePanel} className="inline-ai" aria-label="就地 AI 分析" tabIndex={-1}>
             <PanelResize name="调整就地分析宽度" variable="--inline-width" initial={29} reverse />
             <div className="inline-ai-head">
-              <div><span className="eyebrow">LOCAL HARNESS</span><h3>就地分析</h3></div>
+              <div><span className="eyebrow">本地分析</span><h3>就地分析</h3></div>
               <div className="inline-ai-actions">
                 <button title="打开完整 AI 工作区" onClick={onFullAI}><ArrowUpRight size={14} /></button>
                 <button title="收起" onClick={onInlineClose}><X size={14} /></button>
@@ -1698,7 +1698,7 @@ export function CaptureWorkspace({
               {live?.content && <div className="inline-answer">{live.content}</div>}
               {evidence.length > 0 && (
                 <div className="inline-evidence">
-                  <div className="section-heading"><h3>Evidence</h3><span>{evidence.length}</span></div>
+                  <div className="section-heading"><h3>证据</h3><span>{evidence.length}</span></div>
                   {evidence.slice(-12).map((item) => (
                     <button
                       key={item.id}

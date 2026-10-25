@@ -1,14 +1,14 @@
-name: Prepare macOS distribution
+name: 准备 macOS 分发包
 
 on:
   workflow_dispatch:
     inputs:
       notarize:
-        description: "Use configured Developer ID and Apple notarization secrets"
+        description: "使用已配置的开发者签名与 Apple 公证凭据"
         type: boolean
         default: false
       draft_release:
-        description: "Attach both builds to a new draft prerelease (never publish)"
+        description: "将两个架构产物附到新草稿预发行（不自动公开）"
         type: boolean
         default: false
 
@@ -41,21 +41,21 @@ jobs:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: engine/uv.lock
-      - name: Install Rust and locked dependencies
+      - name: 安装 Rust 与锁定依赖
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           npm ci
           uv sync --locked --project engine --group dev
-      - name: Compile source and freeze engine
+      - name: 编译检查与冻结引擎
         run: |
           uv run --locked --project engine python -m compileall -q engine/ai_proxy_engine
           cargo fmt --check --manifest-path src-tauri/Cargo.toml
           npm run engine:freeze
-      - name: Build development preview
+      - name: 构建开发预览
         if: ${{ !inputs.notarize }}
         run: npm run app:build
-      - name: Build with Developer ID and notarization
+      - name: 使用开发者签名并公证
         if: ${{ inputs.notarize }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -83,7 +83,7 @@ jobs:
           node -e 'require("fs").writeFileSync(process.env.RUNNER_TEMP+"/signing.json", JSON.stringify({bundle:{macOS:{signingIdentity:process.env.APPLE_SIGNING_IDENTITY,hardenedRuntime:true}}}))'
           npm run tauri -- build --config "$RUNNER_TEMP/signing.json"
           node scripts/build-metadata.mjs
-      - name: Prepare versioned ZIP, DMG, provenance, notices and checksums
+      - name: 准备安装包、来源信息、声明与校验文件
         env:
           NOTARIZE: ${{ inputs.notarize }}
         run: |
@@ -114,7 +114,7 @@ jobs:
           pattern: ai-proxy-macos-*
           path: release
           merge-multiple: true
-      - name: Create draft prerelease with explicitly named architecture assets
+      - name: 创建包含架构标识产物的草稿预发行
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -123,5 +123,5 @@ jobs:
           mapfile -d '' assets < <(find release -type f \( -name '*.zip' -o -name '*.dmg' \) -print0)
           if [ "${#assets[@]}" -ne 4 ]; then echo 'Expected ZIP and DMG for both architectures'; exit 1; fi
           mapfile -d '' records < <(find release -type f \( -name '*-SHA256SUMS.txt' -o -name '*-build.json' \) -print0)
-          gh release create "v$version" "${assets[@]}" "${records[@]}" --draft --prerelease --target "$GITHUB_SHA" --title "AI Proxy $version preview" --notes-file "docs/release-notes-$version.md"
+          gh release create "v$version" "${assets[@]}" "${records[@]}" --draft --prerelease --target "$GITHUB_SHA" --title "AI 抓包助手 $version 开发预览" --notes-file "docs/release-notes-$version.md"
           # No publish step: maintainers review acceptance, licenses and Gatekeeper first.

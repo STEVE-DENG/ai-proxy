@@ -1,16 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#213b30"/>
-      <stop offset="1" stop-color="#315e4a"/>
-    </linearGradient>
-    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#f7f1e4"/>
-      <stop offset="1" stop-color="#eab08f"/>
-    </linearGradient>
-  </defs>
-  <rect width="1024" height="1024" rx="220" fill="url(#bg)"/>
-  <circle cx="512" cy="512" r="320" fill="none" stroke="#f7f1e4" stroke-opacity=".12" stroke-width="10" stroke-dasharray="20 28"/>
-  <path d="M220 540h110l55-168 88 336 86-292 66 178 60-72h119" fill="none" stroke="url(#line)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="512" cy="512" r="28" fill="#e47948"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">抓包助手网络图标</title>
+  <desc id="desc">浅薄荷绿底的无文字网络抓包符号；应用实际使用同目录文档中的位图图标。</desc>
+  <defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#dcede5"/><stop offset="1" stop-color="#b9d8ca"/></linearGradient></defs>
+  <rect x="60" y="60" width="904" height="904" rx="190" fill="url(#bg)"/>
+  <g fill="none" stroke="#4d8672" stroke-width="33" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M190 430h90c56 0 62 80 120 80h224c58 0 64-80 120-80h90M190 610h90c56 0 62-80 120-80h224c58 0 64 80 120 80h90"/>
+    <rect x="385" y="350" width="254" height="330" rx="56"/>
+  </g>
+  <g fill="#4d8672"><circle cx="190" cy="430" r="36"/><circle cx="190" cy="610" r="36"/><circle cx="834" cy="610" r="36"/></g>
+  <circle cx="834" cy="430" r="39" fill="#e3b79d"/>
 </svg>

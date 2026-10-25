@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { verifyEngine } from './engine-metadata.mjs';
 export function sourceFingerprint() {
-  const names = execFileSync('git',['ls-files','--cached','--others','--exclude-standard','-z'],{encoding:'utf8'}).split('\0').filter(name => /^(src\/|src-tauri\/(src\/|icons\/|capabilities\/|Cargo\.|tauri.conf|build.rs)|engine\/(ai_proxy_engine\/|pyproject|uv.lock|entrypoint)|public\/|scripts\/freeze-engine.sh|package(-lock)?\.json|vite.config|tsconfig|index.html)/.test(name) && fs.existsSync(name));
+  const names = execFileSync('git',['ls-files','--cached','--others','--exclude-standard','-z'],{encoding:'utf8'}).split('\0').filter(name => /^(src\/|src-tauri\/(src\/|icons\/|capabilities\/|Cargo\.|tauri.conf|Info\.plist|build.rs)|engine\/(ai_proxy_engine\/|pyproject|uv.lock|entrypoint)|public\/|scripts\/freeze-engine.sh|package(-lock)?\.json|vite.config|tsconfig|index.html)/.test(name) && fs.existsSync(name));
   const hash = crypto.createHash('sha256');
   for (const name of [...new Set(names)].sort()) { hash.update(name+'\0'); hash.update(fs.readFileSync(name)); }
   return hash.digest('hex');

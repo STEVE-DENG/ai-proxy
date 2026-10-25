@@ -1,7 +1,7 @@
 [package]
 name = "ai-proxy"
-version = "0.2.0"
-description = "A local AI-assisted web debugging proxy"
+version = "0.2.1"
+description = "本地抓包与 AI 辅助接口调试工具"
 authors = ["dengxurui"]
 license = "MIT"
 repository = "https://github.com/STEVE-DENG/ai-proxy"

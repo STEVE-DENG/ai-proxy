@@ -2,7 +2,7 @@
 
 [返回 README](../README.md) · [安装](install.md) · [开发指南](development.md) · [验收记录](validation.md)
 
-当前准备版本为`0.2.0`开发预览。包已生成、GitHub流程已编写、GitHub流程已运行、Release已公开是四个独立状态，不能混用。实际执行结果见验收记录。
+当前准备版本为`0.2.1`开发预览。包已生成、GitHub流程已编写、GitHub流程已运行、Release已公开是四个独立状态，不能混用。实际执行结果见验收记录。
 
 ## 一条命令准备本机产物
 
@@ -12,7 +12,7 @@ npm run engine:sync
 npm run release:prepare
 ```
 
-命令冻结锁定Python引擎、构建Tauri，再按实际架构生成`release/0.2.0/macos-arm64/`或`macos-x64/`。仅准备本地产物，不推送Git、创建tag、上传或启动应用。已有输出目录拒绝覆盖，避免同一版本的指纹被无声替换。
+命令冻结锁定Python引擎、构建Tauri，再按实际架构生成`release/0.2.1/macos-arm64/`或`macos-x64/`。仅准备本地产物，不推送Git、创建tag、上传或启动应用。已有输出目录拒绝覆盖，避免同一版本的指纹被无声替换。
 
 已经成功构建且源码未变化时可运行`npm run release:prepare -- --skip-build`。冻结时先记录Python源码/锁文件/架构与sidecar指纹，构建前验证；构建记录再绑定界面源码/图标/配置/锁文件与主程序、sidecar指纹，任何不一致拒绝准备。`npm run version:set -- 0.2.1`同步七份版本清单/锁文件；依赖版本不变。更新版本后还应补对应`docs/release-notes-版本.md`。
 
@@ -29,7 +29,7 @@ npm run release:prepare
 
 `.github/workflows/release.yml`只由`workflow_dispatch`启动，不因普通push/PR发布。分别使用macos-15/arm64和macos-15-intel构建；主程序与sidecar的实际架构必须一致。当前仅本机arm64构建有执行记录，不能因为有矩阵就声称Intel可用。
 
-默认产物留在Actions artifacts。`draft_release=true`时，需两边构建均成功、干净checkout和指纹校验通过，才创建`v版本`的**草稿预发行**；附DMG/ZIP、校验文件与构建信息，永不自动公开。Git提交、推送、触发远端流程和公开发行按用户授权处理；本轮没有执行这些动作。
+默认产物留在Actions artifacts。`draft_release=true`时，需两边构建均成功、干净checkout和指纹校验通过，才创建`v版本`的**草稿预发行**；附DMG/ZIP、校验文件与构建信息，永不自动公开。本次用户已授权发布0.2.1中文开发预览；本机Apple芯片产物可直接附到预发行，不冒充双架构工作流已通过。手动工作流仍只创建草稿，公开发布由维护者明确操作。
 
 GitHub要求手动流程先存在于默认分支，才能从Actions面板启动。见[官方说明](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)。[Runner架构](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)不是实机验收结果。
 

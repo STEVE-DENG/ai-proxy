@@ -58,7 +58,7 @@ export function HelpDialog({ open, onClose, onNavigate }: { open: boolean; onClo
     {!matches.length && <p>没有匹配说明。试试功能名称，或清空搜索查看全部。</p>}
     <div className="help-topics">{matches.map(item => <details key={item.name} open={query ? true : undefined}><summary>{item.name}</summary><p>{item.steps}</p><p className="boundary-note">{item.impact}</p><button className="button ghost compact" onClick={() => onNavigate(item.route)}>打开{item.name}</button></details>)}</div>
     <details><summary>本地只读工具缓存</summary><p>只缓存固定范围内成功的读取，最多128项/8 MiB，有效期2分钟；清理不会删除调查证据或影响供应商缓存。</p><div className="qa-actions"><button className="button ghost compact" onClick={() => void call<Record<string, number>>("agent.cache-status").then(setCache).catch(reason => setError(String(reason)))}>查看用量</button><button className="button ghost compact" onClick={() => void call<Record<string, number>>("agent.cache-clear").then(setCache).catch(reason => setError(String(reason)))}>清理本地工具缓存</button></div>{cache && <p>条目 {cache.entries} · 大小 {cache.bytes} 字节 · 命中 {cache.hits} · 未命中 {cache.misses}</p>}{error && <p role="alert">{error}</p>}</details>
-    <p className="small">AI Proxy {version} · 开发预览 · 本地工作区</p>
+    <p className="small">AI 抓包助手 {version} · 开发预览 · 本地工作区</p>
     <p>快捷键：⌘/Ctrl + / 打开帮助；输入区 Enter 发送，Shift + Enter 换行，中文输入法确认不会误发送。Tab 导航，弹窗 Esc 返回。</p>
   </Dialog>;
 }

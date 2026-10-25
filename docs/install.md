@@ -4,7 +4,7 @@
 
 ## 下载哪个包
 
-维护者发布后，可从 [GitHub Releases](https://github.com/STEVE-DENG/ai-proxy/releases) 下载与芯片一致的版本；本地准备的产物不代表已有公开 Release。
+从[版本下载页](https://github.com/STEVE-DENG/ai-proxy/releases/tag/v0.2.1)下载中文开发预览版。本次仅提供 Apple 芯片 Mac（M 系列）安装包。
 
 | Mac | 文件名中的平台 | 当前验证情况 |
 | --- | --- | --- |
@@ -15,10 +15,10 @@
 
 下载对应 DMG 与同平台 `SHA256SUMS` 文件。需要校验下载内容时，在下载目录运行 `shasum -a 256 -c AI-Proxy-版本-平台-SHA256SUMS.txt`；清单同时列出 ZIP 和 DMG，只下载其一时对照该文件对应的一行。
 
-## 拖入 Applications
+## 拖入「应用程序」
 
-1. 打开 DMG，将 `AI Proxy.app` 拖到 `Applications`。也可解压 ZIP 后拖入应用程序目录。
-2. 从 Applications 打开。包内包含 Python 引擎，使用者无需安装 Python、Node、Rust、uv 或后台服务。
+1. 打开 DMG，将 `AI Proxy.app` 拖到 「应用程序」。也可解压 ZIP 后拖入应用程序目录。
+2. 从「应用程序」打开。包内包含 Python 引擎，使用者无需安装 Python、Node、Rust、uv 或后台服务。
 3. 当前带 `preview` 的 ad-hoc 包未经过 Apple 公证，macOS 可能要求在「系统设置 → 隐私与安全性」核准打开。只核准你核对过来源的包，不关闭系统保护。正式顺畅分发还需维护者的 Developer ID、公证和另一台干净 Mac 验证。
 
 更新前正常退出旧应用，保留完整应用数据目录。不要在运行中替换；安装包不会替你清理设备上的旧 CA。

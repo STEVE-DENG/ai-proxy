@@ -241,3 +241,21 @@ Developer ID、公证、双架构远端构建、GitHub Release、Intel/另一台
 用户明确要求替换Applications并提交推送。再次执行`npm run app:install`，构建来源、冻结引擎来源、安装前后深度严格签名和二进制指纹校验通过；安装报告状态为`installed`。版本仍为上述0.2.0，二进制指纹未变，未启动应用。此次旧包备份为`/Applications/.AI Proxy.backup-2026-10-25T03-40-53-645Z.app`。
 
 本次将累积源码及文档提交到`codex/full-ai-agent-workflows`，目标远端为`origin`（`STEVE-DENG/ai-proxy`）；上节“未提交/推送”描述的是此前构建时状态。提交前`git diff --check`通过，待纳入文件未发现常见私钥/API Token模式或超过10MiB文件；此模式检查不替代完整安全审计。构建产物、发行包、实际凭据和本地数据库由`.gitignore`排除。本次不触发远端发行工作流，不创建或发布Release，未完成TODO继续保留。
+
+
+## 0.2.1 中文预发行构建（2026-10-25）
+
+用户授权发布，并明确图标不加文字、颜色清新淡雅。本轮更新中文介绍、栏目和图标提示、中文应用显示名、浅薄荷绿无文字图标及各尺寸资源；包标识与安装路径保持兼容。未自动启动应用、代理或真实模型，也未创建/运行测试套件。
+
+已通过：TypeScript/Vite生产构建、Python compileall、引擎冻结、Tauri release打包、应用深度严格签名校验、主程序与引擎arm64、中文Info.plist语法与CFBundleDisplayName核对、发行/来源脚本语法、发行工作流YAML解析、架构SVG及399个本地Markdown目标核对、git diff --check。主JS约525.82kB，仍有Vite500kB提示；这不等于真实流量性能已验收。
+
+依赖声明收集器补充标准许可文本、上游署名和锁定版本源码位置后，缺失文本清单为0。许可证保持原文；这一检查不替代完整法律审计。当前包仍为临时签名、未公证，Intel与真实设备/模型验收保持开放。
+
+构建来源指纹：`0cf8e21da20da5c38d61b8ac9575238bf0dc10b0bafd8241dcdea35c3623a909`；引擎来源：`cb9905e37c275252916c101d650cf328e5e9ac2a2966a67298e58210c39439c5`。
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `ai-proxy` | `165b9c1fa5ac914e734be1ecf929ef6290ca617d75c5e8f8913d1753e02f601e` |
+| `ai-proxy-engine` | `e6fab07f7f51fe80357b6de466ac044e1db46fcc2b7a1c47e6aa5b802216c124` |
+
+分发产物位于`release/0.2.1/macos-arm64/`；包内安装说明为中文，并包含依赖许可与源码获取说明。发布状态和文件摘要以[0.2.1版本页](https://github.com/STEVE-DENG/ai-proxy/releases/tag/v0.2.1)与对应校验文件为准。原TODO不因本次发布关闭。

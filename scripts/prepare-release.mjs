@@ -43,7 +43,7 @@ const metadata = {version, platform, createdAt:new Date().toISOString(), commit:
 try {
   const copied = path.join(stage,'AI Proxy.app');
   run('/usr/bin/ditto',[app,copied]);
-  fs.symlinkSync('/Applications',path.join(stage,'Applications'));
+  fs.symlinkSync('/Applications',path.join(stage,'应用程序'));
   for (const name of ['LICENSE','THIRD_PARTY_NOTICES.md']) fs.copyFileSync(name,path.join(stage,name));
   const notices = path.join(out,'notices');
   run(path.join(root,'engine/.venv/bin/python'), ['scripts/collect-licenses.py',notices]);
@@ -51,13 +51,14 @@ try {
   metadata.licenseTextReviewCount = review.length;
   if (flags.has('--require-notarized') && review.length) throw new Error('License texts require review before public distribution.');
   fs.cpSync(notices,path.join(stage,'notices'),{recursive:true});
-  const install = `# AI Proxy ${version}\n\nPlatform: ${platform}. ${metadata.signing}; notarized: ${notarized}.\n\nOpen the disk image and drag AI Proxy.app onto Applications. Then open it from Applications. Python, Node and Rust are bundled or unnecessary at runtime.\n\n${notarized ? 'The package includes a notarization ticket; verify it on a clean target Mac.' : 'Development preview: Gatekeeper may require approval in System Settings > Privacy & Security. It is not a zero-friction public installer. Do not disable Gatekeeper.'}\n\nCapturing and offline HAR import do not require a Provider. Choose phone, local capture or offline import in Help. New projects start without HTTPS decryption. HTTPS capture needs device CA installation/trust; AI needs your own Provider account.\n\nUpgrade after quitting the app. Preserve the app data directory, not only SQLite. This build has pending manual acceptance. License texts needing review: ${review.length}; see notices/license-review.json.\n`;
+  const install = `# AI 抓包助手 ${version} 安装说明\n\n平台：${platform === 'macos-arm64' ? 'Apple 芯片 Mac（M 系列）' : 'Intel Mac'}。签名：${metadata.signing === 'ad-hoc' ? '临时签名' : '身份签名'}；Apple 公证：${notarized ? '已完成' : '未完成'}。\n\n打开磁盘映像，将 AI Proxy.app 拖到「应用程序」，再从该目录打开。应用包含 Python 引擎，无需另装 Python、Node 或 Rust。\n\n${notarized ? '包内包含公证票据；目标 Mac 上的实际运行仍需核对。' : '本版本为开发预览，macOS 可能要求在「系统设置 → 隐私与安全性」中核准打开。请先核对来源，不要关闭系统保护。'}\n\n本地抓包和离线导入不需要模型账户。在「帮助」中选择手机、本机或离线导入；新项目默认不解密 HTTPS。HTTPS 需要在设备上安装并信任项目证书；AI 分析需配置自己的模型服务。\n\n升级前退出旧应用，并备份完整应用数据目录，不能只备份数据库。当前仍有人工验收未完成。需要核查的许可证文本：${review.length} 项，详见 notices/license-review.json；第三方原始许可与源码位置见 notices 目录。\n`;
+
   fs.writeFileSync(path.join(stage,'INSTALL.md'),install); fs.writeFileSync(path.join(out,'INSTALL.md'),install);
   fs.writeFileSync(path.join(stage,'build.json'),JSON.stringify(metadata,null,2)+'\n');
   const prefix = `AI-Proxy-${version}-${platform}${notarized?'':'-preview'}`;
   const zip = path.join(out,prefix+'.zip'), dmg=path.join(out,prefix+'.dmg');
   run('/usr/bin/ditto',['-c','-k',stage,zip]);
-  run('/usr/bin/hdiutil',['create','-volname',`AI Proxy ${version}`,'-srcfolder',stage,'-format','UDZO',dmg]);
+  run('/usr/bin/hdiutil',['create','-volname',`AI 抓包助手 ${version}`,'-srcfolder',stage,'-format','UDZO',dmg]);
   run('/usr/bin/hdiutil',['verify',dmg]);
   metadata.assets = [zip,dmg].map(file=>({name:path.basename(file),bytes:fs.statSync(file).size,sha256:sha(file)}));
   fs.writeFileSync(path.join(out,'build.json'),JSON.stringify(metadata,null,2)+'\n');

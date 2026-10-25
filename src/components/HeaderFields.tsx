@@ -13,6 +13,6 @@ export function HeaderFields({ value, onChange }: { value: string; onChange: (va
       <input aria-label={`第${index + 1}个 Header 值`} value={content} placeholder="值" onChange={event => update(rows.map((row, i) => i === index ? [row[0], event.target.value] : row))} />
       <button className="button ghost compact" onClick={() => update(rows.filter((_, i) => i !== index))}>移除</button>
     </div>)}<button className="button ghost compact" onClick={() => update([...rows, ["", ""]])}>添加 Header</button></> : <p role="alert">Header JSON 格式无效，请在高级编辑中修正；原输入已保留。</p>}
-    <details><summary>高级 JSON 编辑</summary><textarea aria-label="Header JSON" rows={5} value={value} onChange={event => onChange(event.target.value)} /></details>
+    <details><summary>高级 JSON 编辑</summary><textarea aria-label="请求头 JSON" rows={5} value={value} onChange={event => onChange(event.target.value)} /></details>
   </div>;
 }

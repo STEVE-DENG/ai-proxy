@@ -41,8 +41,8 @@ export function TopBar({
       <div className="brand" data-tauri-drag-region>
         <div className="brand-mark" data-tauri-drag-region><img src="/brand/app-icon.png" alt="" draggable={false} /></div>
         <div data-tauri-drag-region>
-          <div className="brand-name" data-tauri-drag-region>AI Proxy</div>
-          <div className="brand-kicker" data-tauri-drag-region>LOCAL TRAFFIC LAB</div>
+          <div className="brand-name" data-tauri-drag-region>AI 抓包助手</div>
+          <div className="brand-kicker" data-tauri-drag-region>本地网络调试</div>
         </div>
       </div>
 

@@ -1,6 +1,6 @@
-<img src="public/brand/app-icon.png" alt="AI Proxy 图标" width="88" />
+<img src="public/brand/app-icon.png" alt="AI 抓包助手图标" width="88" />
 
-# AI Proxy
+# AI 抓包助手
 
 **在一台 Mac 上，把接口问题从抓包追到可复核的证据。**
 
@@ -8,9 +8,9 @@
 
 ![从手机与本机采集请求，整理成证据的概念插图](docs/media/workflow-illustration.png)
 
-[English](README.en.md) · [安装与首次使用](docs/install.md) · [使用指南](docs/user-guide.md) · [完整功能](docs/features.md) · [贡献指南](CONTRIBUTING.md)
+[安装与首次使用](docs/install.md) · [使用指南](docs/user-guide.md) · [完整功能](docs/features.md) · [贡献指南](CONTRIBUTING.md)
 
-> **0.2.0 开发预览。** 本地抓包和离线数据查看无需部署服务端，也不需要模型账户；AI 分析使用你配置的供应商。原问题待办、真实 Provider、手机和完整桌面验收尚未关闭。[逐项进度](docs/completion-tracker.md)。当前本机构建为 ad-hoc 签名、未公证，不能视为下载即用的正式发行。
+> **0.2.1 开发预览。** 本地抓包和离线数据查看无需部署服务端，也不需要模型账户；AI 分析使用你配置的供应商。原问题待办、真实 Provider、手机和完整桌面验收尚未关闭。[逐项进度](docs/completion-tracker.md)。当前本机构建为 ad-hoc 签名、未公证，不能视为下载即用的正式发行。
 
 ## 可以用它做什么
 
@@ -27,9 +27,11 @@ Agent 默认只读；调试模式的写操作需要预览和审批。开启自�
 
 ## 下载与安装
 
-[版本下载入口](https://github.com/STEVE-DENG/ai-proxy/releases) · [安装说明](docs/install.md) · [0.2.0变更](docs/release-notes-0.2.0.md)
+[版本下载入口](https://github.com/STEVE-DENG/ai-proxy/releases) · [安装说明](docs/install.md) · [0.2.1变更](docs/release-notes-0.2.1.md)
 
-分发包按版本和芯片区分，DMG内将应用拖入Applications即可安装，Python引擎随应用提供。版本下载入口没有对应产物时，表示尚未公开发行，可使用下方源码流程。本地准备包不代表已上传GitHub；当前预览包仍可能需要macOS安全核准。
+本次预发行提供 **Apple 芯片 Mac（M 系列）** 的 DMG 和 ZIP。打开 DMG，将 `AI Proxy.app` 拖入「应用程序」即可安装，Python 引擎随应用提供。Intel 版尚未发布；当前预览包未经过 Apple 公证，首次打开可能需要在系统设置中核准。
+
+[下载 0.2.1 中文预览版](https://github.com/STEVE-DENG/ai-proxy/releases/tag/v0.2.1) · [查看安装方法](docs/install.md)
 
 ## 从采集到交接
 
