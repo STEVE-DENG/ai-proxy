@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620" role="img" aria-labelledby="title desc">
+<title id="title">AI Proxy architecture and data boundaries</title><desc id="desc">React calls Tauri over IPC. Tauri owns native permissions and credentials. Python stores captures locally and executes scoped analysis. Only configured AI context goes to a Provider; traffic goes to the requested service through the proxy.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0 0L9 4.5 0 9" fill="none" stroke="#315e4a" stroke-width="1.5"/></marker><style>text{font-family:ui-sans-serif,system-ui,sans-serif;fill:#17231e} .title{font-size:28px;font-weight:650}.label{font-size:20px;font-weight:650}.note{font-size:16px;fill:#445a4b}.box{fill:#faf7ef;stroke:#809782;stroke-width:1.5}.flow{fill:none;stroke:#315e4a;stroke-width:2;marker-end:url(#arrow)}</style></defs>
+<rect width="1280" height="620" rx="20" fill="#eee9dd"/>
+<text x="44" y="54" class="title">AI Proxy · local capture, scoped investigation</text>
+<rect x="32" y="84" width="914" height="500" rx="18" fill="#e3e8df" stroke="#809782" stroke-dasharray="6 5"/>
+<text x="54" y="118" class="note">YOUR MAC</text>
+<rect x="54" y="150" width="236" height="132" rx="12" class="box"/><text x="74" y="190" class="label">React / TypeScript</text><text x="74" y="222" class="note">Capture · Agent · QA</text><text x="74" y="250" class="note">Evidence and approvals</text>
+<rect x="354" y="150" width="242" height="132" rx="12" class="box"/><text x="374" y="190" class="label">Rust / Tauri</text><text x="374" y="222" class="note">IPC · native permissions</text><text x="374" y="250" class="note">Local credential file</text>
+<rect x="660" y="150" width="262" height="132" rx="12" class="box"/><text x="680" y="190" class="label">Python engine</text><text x="680" y="222" class="note">Scopes · versions · redaction</text><text x="680" y="250" class="note">Agent tools · QA workflows</text>
+<path d="M292 210H350" class="flow"/><path d="M598 210H656" class="flow"/>
+<rect x="1010" y="150" width="236" height="132" rx="12" class="box"/><text x="1030" y="190" class="label">Configured Provider</text><text x="1030" y="222" class="note">User-triggered model calls</text><text x="1030" y="250" class="note">Redacted context</text><path d="M924 210H1006" class="flow"/>
+<rect x="54" y="380" width="236" height="128" rx="12" class="box"/><text x="74" y="420" class="label">Phone / local app</text><text x="74" y="452" class="note">Explicit proxy setup</text><text x="74" y="480" class="note">Device CA trust for HTTPS</text>
+<rect x="354" y="380" width="242" height="128" rx="12" class="box"/><text x="374" y="420" class="label">Local HTTP(S) proxy</text><text x="374" y="452" class="note">Rules · throttling</text><text x="374" y="480" class="note">Bounded capture and waits</text>
+<rect x="660" y="380" width="262" height="128" rx="12" class="box"/><text x="680" y="420" class="label">Project storage</text><text x="680" y="452" class="note">SQLite · bodies · CA</text><text x="680" y="480" class="note">Runs · evidence · reports</text>
+<path d="M292 444H350" class="flow"/><path d="M598 444H656" class="flow"/><path d="M792 284V376" class="flow"/>
+<rect x="1010" y="380" width="236" height="128" rx="12" class="box"/><text x="1030" y="420" class="label">Requested service</text><text x="1030" y="452" class="note">Real request side effects</text><text x="1030" y="480" class="note">No automatic resend</text>
+<path d="M476 510V548H1126V512" class="flow"/>
+<text x="54" y="562" class="note">Raw local data and credentials are not bundled into shared evidence packages.</text>
+</svg>

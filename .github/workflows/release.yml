@@ -1,0 +1,127 @@
+name: Prepare macOS distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      notarize:
+        description: "Use configured Developer ID and Apple notarization secrets"
+        type: boolean
+        default: false
+      draft_release:
+        description: "Attach both builds to a new draft prerelease (never publish)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distribution-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.10.7"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: engine/uv.lock
+      - name: Install Rust and locked dependencies
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          npm ci
+          uv sync --locked --project engine --group dev
+      - name: Compile source and freeze engine
+        run: |
+          uv run --locked --project engine python -m compileall -q engine/ai_proxy_engine
+          cargo fmt --check --manifest-path src-tauri/Cargo.toml
+          npm run engine:freeze
+      - name: Build development preview
+        if: ${{ !inputs.notarize }}
+        run: npm run app:build
+      - name: Build with Developer ID and notarization
+        if: ${{ inputs.notarize }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then echo "Missing required signing secret: $name"; exit 1; fi
+          done
+          # Ephemeral CI signing keychain, independent of runtime Provider storage.
+          build_keychain="$RUNNER_TEMP/ai-proxy-signing.keychain-db"
+          signing_password=$(openssl rand -hex 24)
+          echo "::add-mask::$signing_password"
+          trap 'security delete-keychain "$build_keychain" >/dev/null 2>&1 || true; rm -f "$RUNNER_TEMP/signing.p12"' EXIT
+          node -e 'require("fs").writeFileSync(process.env.RUNNER_TEMP+"/signing.p12", Buffer.from(process.env.APPLE_CERTIFICATE,"base64"), {mode:0o600})'
+          security create-keychain -p "$signing_password" "$build_keychain"
+          security set-keychain-settings -t 3600 -u "$build_keychain"
+          security unlock-keychain -p "$signing_password" "$build_keychain"
+          security list-keychains -d user -s "$build_keychain" login.keychain-db
+          security import "$RUNNER_TEMP/signing.p12" -k "$build_keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$signing_password" "$build_keychain" >/dev/null
+          node -e 'require("fs").writeFileSync(process.env.RUNNER_TEMP+"/signing.json", JSON.stringify({bundle:{macOS:{signingIdentity:process.env.APPLE_SIGNING_IDENTITY,hardenedRuntime:true}}}))'
+          npm run tauri -- build --config "$RUNNER_TEMP/signing.json"
+          node scripts/build-metadata.mjs
+      - name: Prepare versioned ZIP, DMG, provenance, notices and checksums
+        env:
+          NOTARIZE: ${{ inputs.notarize }}
+        run: |
+          if [ "$NOTARIZE" = true ]; then
+            npm run release:prepare -- --skip-build --require-notarized
+          else
+            npm run release:prepare -- --skip-build
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ai-proxy-${{ matrix.runner }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 14
+
+  draft:
+    if: ${{ inputs.draft_release }}
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ai-proxy-macos-*
+          path: release
+          merge-multiple: true
+      - name: Create draft prerelease with explicitly named architecture assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          node scripts/check-release.mjs
+          mapfile -d '' assets < <(find release -type f \( -name '*.zip' -o -name '*.dmg' \) -print0)
+          if [ "${#assets[@]}" -ne 4 ]; then echo 'Expected ZIP and DMG for both architectures'; exit 1; fi
+          mapfile -d '' records < <(find release -type f \( -name '*-SHA256SUMS.txt' -o -name '*-build.json' \) -print0)
+          gh release create "v$version" "${assets[@]}" "${records[@]}" --draft --prerelease --target "$GITHUB_SHA" --title "AI Proxy $version preview" --notes-file "docs/release-notes-$version.md"
+          # No publish step: maintainers review acceptance, licenses and Gatekeeper first.

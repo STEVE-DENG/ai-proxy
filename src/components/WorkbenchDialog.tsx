@@ -1,3 +1,8 @@
+import { Select } from "./Select";
+import { ReportSelect } from "./ReportSelect";
+import sampleHar from "../../examples/capture.har.json";
+import { TaskProgress } from "./OperationFeedback";
+import { PerformancePanel } from "./ExperiencePanels";
 import {
   Activity,
   Check,
@@ -18,7 +23,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { QAWorkspace, ProjectWorkspace } from "./QAWorkspace";
 import { Dialog } from "./Dialogs";
 import type {
@@ -28,7 +33,6 @@ import type {
   DebugVerification,
   ImportRecord,
   McpServer,
-  Report,
   RequestSummary,
   RunBudget,
   ThrottleStatus,
@@ -61,7 +65,7 @@ interface Props {
   mcpServers: McpServer[];
   debugActions: DebugAction[];
   runs: AnalysisRun[];
-  reports: Report[];
+  reports: import("../types").ReportSummary[];
   selectedRequest: RequestSummary | null;
   throttle: ThrottleStatus;
   budget: RunBudget | null;
@@ -86,6 +90,7 @@ const defaultBusiness = {
 };
 
 function tabFrom(value?: string): WorkbenchTab {
+  if (value?.startsWith("qa:")) return "qa";
   const allowed: WorkbenchTab[] = ["qa", "projects", "environments", "business", "associations", "imports", "integrations", "debug", "runs"];
   return allowed.includes(value as WorkbenchTab) ? value as WorkbenchTab : "environments";
 }
@@ -111,7 +116,17 @@ export function WorkbenchDialog({
   const [sharedSessionId, setSharedSessionId] = useState("");
   useEffect(() => { if (open) void call<Array<{ id: string; title: string }>>("sessions.list").then(items => { setSharedSessions(items); setSharedSessionId(value => value || items[0]?.id || ""); }).catch(reason => setMessage(String(reason))); }, [open]);
   const [tab, setTab] = useState<WorkbenchTab>("environments");
+  const [qaVisited, setQaVisited] = useState(false);
+  useEffect(() => { if (tab === "qa") setQaVisited(true); }, [tab]);
   const [busy, setBusy] = useState(false);
+  const operationBusy = useRef(false);
+  const beginOperation = () => {
+    if (operationBusy.current) return false;
+    operationBusy.current = true;
+    setBusy(true);
+    return true;
+  };
+  const endOperation = () => { operationBusy.current = false; setBusy(false); };
   const [message, setMessage] = useState<string | null>(null);
   const [environment, setEnvironment] = useState(defaultEnvironment);
   const [business, setBusiness] = useState(defaultBusiness);
@@ -120,7 +135,12 @@ export function WorkbenchDialog({
   const [debugType, setDebugType] = useState("map-remote");
   const [debugPayload, setDebugPayload] = useState('{\n  "source": "https://api.example.com/v1/*",\n  "target": "http://127.0.0.1:3000/v1/"\n}');
   const [debugAction, setDebugAction] = useState<DebugAction | null>(null);
-  const [replay, setReplay] = useState<Record<string, any> | null>(null);
+  const [replayValue, setReplay] = useState<Record<string, any> | null>(null);
+  const [replaySource, setReplaySource] = useState("");
+  const requestIdentity = `${selectedRequest?.id || ""}:${selectedRequest?.version || 0}`;
+  const currentRequest = useRef(requestIdentity);
+  currentRequest.current = requestIdentity;
+  const replay = replaySource === requestIdentity ? replayValue : null;
   const [mcp, setMcp] = useState({ name: "", endpoint: "", allowedTools: "search_knowledge" });
   const [mcpCall, setMcpCall] = useState({ serverId: "", toolName: "", arguments: "{}" });
   const [observability, setObservability] = useState({ endpoint: "", traceId: "" });
@@ -139,20 +159,38 @@ export function WorkbenchDialog({
   useEffect(() => {
     if (open) {
       setTab(tabFrom(initialTab));
-      setMessage(null);
-      setDebugAction(null);
-      setReplay(null);
-      setObservabilityResult(null);
-      setOpenApiTemplates([]);
       setMcpCall((value) => ({ ...value, serverId: value.serverId || mcpServers[0]?.id || "" }));
       setTicket((value) => ({ ...value, reportId: value.reportId || reports[0]?.id || "" }));
-      setDebugVerification(null);
       setBudgetDraft(budget);
     }
   }, [open, initialTab]);
 
+  const performOperation = async (operation: () => Promise<unknown>, reload = false) => {
+    if (!beginOperation()) return;
+    setMessage(null);
+    let received = false;
+    try {
+      await operation();
+      received = true;
+      if (reload) await onChanged();
+    } catch (reason) {
+      setMessage(received ? `操作已有回执，但页面刷新失败，请刷新核对；不要重复提交。${String(reason)}` : String(reason));
+    } finally { endOperation(); }
+  };
+
+  const shareMockFile = () => performOperation(async () => {
+    const payload = JSON.parse(debugPayload);
+    const path = await pickLocalFile();
+    if (!path) return;
+    await call("sessions.add-file", { sessionId: sharedSessionId, path });
+    setDebugPayload(JSON.stringify({ ...payload, filePath: path }, null, 2));
+    setDebugAction(null);
+    setDebugVerification(null);
+    setMessage("已授权此文件，应用前仍会核对内容摘要。");
+  });
+
   const saveConfig = async (kind: string, name: string, config: Record<string, any>, activate = false) => {
-    setBusy(true);
+    if (!beginOperation()) return;
     setMessage(null);
     try {
       await call("configs.save", { kind, name, config, enabled: true, activate });
@@ -161,14 +199,14 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const importJson = async (kind: "har" | "openapi" | "otlp") => {
     const path = await pickLocalFile();
     if (!path) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     setMessage(null);
     try {
       const raw = await readTextFile(path);
@@ -182,7 +220,7 @@ export function WorkbenchDialog({
       await onChanged();
       setMessage(
         kind === "har"
-          ? `HAR 已导入到新批次：${result.imported} 条。`
+          ? `HAR 已导入到新批次：${result.imported} 条，跳过/未包含 ${result.skipped ?? 0} 条（其中处理失败 ${result.failedCount ?? 0} 条），超出限额 ${result.omittedEntries ?? 0} 条。请核对原始条目数与正文保存状态。${result.failures?.length ? `失败详情：${JSON.stringify(result.failures)}` : ""}`
           : kind === "openapi"
             ? `OpenAPI 已导入：${result.summary?.operations || 0} 个操作。`
             : `OTLP 已导入：${result.imported || 0} 个 Span。`,
@@ -190,13 +228,13 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const exportHar = async () => {
     if (!await confirmAction("导出原始 HAR 会保留 URL、Header 和正文中的敏感值。确认保存到本地？交接可使用 QA 工作台的脱敏证据包。")) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     try {
       const data = await call<Record<string, any>>("exports.har", {});
       const saved = await saveTextFile("ai-proxy-export.har", JSON.stringify(data, null, 2));
@@ -204,12 +242,12 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const previewDebug = async () => {
-    setBusy(true);
+    if (!beginOperation()) return;
     setMessage(null);
     try {
       const payload = { ...JSON.parse(debugPayload), ...(debugType === "map-local" ? { ownerSessionId: sharedSessionId } : {}) };
@@ -219,13 +257,13 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const applyDebug = async () => {
     if (!debugAction) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     try {
       const action = await call<DebugAction>("debug.apply", { actionId: debugAction.id });
       setDebugAction(action);
@@ -234,12 +272,12 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const restoreDebug = async (actionId: string) => {
-    setBusy(true);
+    if (!beginOperation()) return;
     try {
       const action = await call<DebugAction>("debug.restore", { actionId });
       setDebugAction(action);
@@ -248,38 +286,42 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const previewReplay = async () => {
     if (!selectedRequest) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     try {
-      setReplay(await call("replay.preview", { requestId: selectedRequest.id }));
+      const source = requestIdentity;
+      const result = await call<Record<string, any>>("replay.preview", { requestId: selectedRequest.id });
+      if (currentRequest.current === source) { setReplay(result); setReplaySource(source); }
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const executeReplay = async () => {
     if (!selectedRequest || !replay?.id) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     try {
-      setReplay(await call("replay.execute", { requestId: selectedRequest.id, actionId: replay.id }));
-      setMessage("重放请求已发送。超时会被标记为结果未知，不会自动重试。");
+      const source = requestIdentity;
+      const result = await call<Record<string, any>>("replay.execute", { requestId: selectedRequest.id, actionId: replay.id });
+      if (currentRequest.current === source) { setReplay(result); setReplaySource(source); }
+      setMessage("重放操作已有回执，请核对预览中的实际状态。结果未知时先查操作历史，不会自动重试。");
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const verifyDebug = async () => {
     if (!debugAction) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     setMessage(null);
     try {
       const result = await call<DebugVerification>("debug.verify", {
@@ -291,13 +333,13 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
   const saveBudget = async () => {
     if (!budgetDraft) return;
-    setBusy(true);
+    if (!beginOperation()) return;
     setMessage(null);
     try {
       const saved = await onBudgetSave(budgetDraft);
@@ -306,7 +348,7 @@ export function WorkbenchDialog({
     } catch (reason) {
       setMessage(String(reason));
     } finally {
-      setBusy(false);
+      endOperation();
     }
   };
 
@@ -316,7 +358,7 @@ export function WorkbenchDialog({
   );
 
   return (
-    <Dialog open={open} title="QA 工作台" kicker="ENVIRONMENT · IMPORTS · INTEGRATIONS · ACTIONS" wide onClose={onClose}>
+    <Dialog open={open} keepMounted title="QA 工作台" kicker="ENVIRONMENT · IMPORTS · INTEGRATIONS · ACTIONS" wide onClose={onClose}>
       <div className="workbench-layout">
         <nav className="workbench-nav">
           <button className={tab === "qa" ? "active" : ""} onClick={() => setTab("qa")}><Check size={15} /> QA 场景</button>
@@ -330,8 +372,9 @@ export function WorkbenchDialog({
           <button className={tab === "runs" ? "active" : ""} onClick={() => setTab("runs")}><Activity size={15} /> 执行记录</button>
         </nav>
 
-        <div className="workbench-content">
-          {tab === "qa" && <QAWorkspace selected={selectedRequest} onSelectRequest={onSelectRequest} onChanged={onChanged} />}
+        <fieldset className="workbench-content task-fields" disabled={busy}>
+          <TaskProgress busy={busy} label="工作台操作处理中" />
+          {(tab === "qa" || qaVisited) && <div style={tab === "qa" ? undefined : {display: "none"}}><QAWorkspace initialSection={initialTab?.startsWith("qa:") ? initialTab.split(":")[1] : undefined} selected={selectedRequest} onSelectRequest={onSelectRequest} onChanged={onChanged} /></div>}
           {tab === "projects" && <ProjectWorkspace />}
           {tab === "environments" && (
             <>
@@ -342,15 +385,15 @@ export function WorkbenchDialog({
               </div>
               <div className="form-grid two">
                 <label className="field"><span>构建号</span><input value={environment.buildNumber} onChange={(event) => setEnvironment({ ...environment, buildNumber: event.target.value })} placeholder="5821" /></label>
-                <label className="field"><span>提取 Header（可选）</span><input placeholder="x-app-version" /></label>
+                <p className="boundary-note">版本与构建号使用这里手动填写并启用的环境值，记录到之后的新请求。</p>
               </div>
               <button className="button primary compact" disabled={busy || !environment.name} onClick={() => void saveConfig("environment", environment.name, environment, true)}><Plus size={13} /> 保存并启用</button>
               <div className="config-list">
                 {environments.map((item) => (
                   <div className="config-row" key={item.id}>
                     <div><b>{item.name}</b><span>{item.config.appVersion || "未填写版本"} · {item.config.buildNumber || "未填写构建号"}</span></div>
-                    <button className="button ghost compact" onClick={async () => { await call("configs.activate-environment", { configId: item.id }); await onChanged(); }}>启用</button>
-                    <button className="rule-icon danger" onClick={async () => { await call("configs.delete", { configId: item.id }); await onChanged(); }}><Trash2 size={12} /></button>
+                    <button className="button ghost compact" disabled={busy} onClick={() => void performOperation(() => call("configs.activate-environment", { configId: item.id }), true)}>启用</button>
+                    <button className="rule-icon danger" disabled={busy} aria-label={`删除 ${item.name}`} onClick={() => void performOperation(() => call("configs.delete", { configId: item.id }), true)}><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -383,7 +426,7 @@ export function WorkbenchDialog({
                 {businessRules.map((item) => (
                   <div className="config-row" key={item.id}>
                     <div><b>{item.name}</b><span>{item.config.hostPattern || "*"} {item.config.pathPattern || "*"} · {item.config.errorPointer}</span></div>
-                    <button className="rule-icon danger" onClick={async () => { await call("configs.delete", { configId: item.id }); await onChanged(); }}><Trash2 size={12} /></button>
+                    <button className="rule-icon danger" disabled={busy} aria-label={`删除 ${item.name}`} onClick={() => void performOperation(() => call("configs.delete", { configId: item.id }), true)}><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -407,7 +450,7 @@ export function WorkbenchDialog({
                 {[...associations, ...dynamicConfigs].map((item) => (
                   <div className="config-row" key={item.id}>
                     <div><b>{item.name}</b><span>{item.kind} · {JSON.stringify(item.config)}</span></div>
-                    <button className="rule-icon danger" onClick={async () => { await call("configs.delete", { configId: item.id }); await onChanged(); }}><Trash2 size={12} /></button>
+                    <button className="rule-icon danger" disabled={busy} aria-label={`删除 ${item.name}`} onClick={() => void performOperation(() => call("configs.delete", { configId: item.id }), true)}><Trash2 size={12} /></button>
                   </div>
                 ))}
               </div>
@@ -419,34 +462,37 @@ export function WorkbenchDialog({
               <div className="settings-heading">
                 <div><span className="eyebrow">INTEROPERABILITY</span><h3>导入与导出</h3></div>
                 <button className="button ghost compact" onClick={async () => {
-                  setBusy(true);
+                  if (!beginOperation()) return;
                   try {
                     setOpenApiTemplates(await call<Array<Record<string, any>>>("openapi.templates", {}));
                   } catch (reason) {
                     setMessage(String(reason));
                   } finally {
-                    setBusy(false);
+                    endOperation();
                   }
                 }}><RefreshCw size={13} /> 按路径模板聚合</button>
               </div>
               <div className="import-grid">
-                <button onClick={() => void importJson("har")}><Upload size={18} /><b>导入 HAR</b><span>新建批次，保留来源与正文缺失状态</span></button>
-                <button onClick={() => void importJson("openapi")}><FileJson2 size={18} /><b>导入 OpenAPI</b><span>本地校验状态码、必填字段和类型</span></button>
-                <button onClick={() => void importJson("otlp")}><Activity size={18} /><b>导入 OTLP JSON</b><span>补齐服务端 Span、Links 与采样信息</span></button>
-                <button onClick={() => void exportHar()}><Download size={18} /><b>导出原始 HAR</b><span>保留原文；上限2万条/20MiB，附未导出数量</span></button>
+                <button disabled={busy} onClick={async () => {
+                  if (busy) return;
+                  if (!beginOperation()) return; setMessage(null);
+                  try { const result = await call<{imported: number}>("imports.har", {data: sampleHar, name: "离线示例"}); await onChanged(); setMessage(`已导入合成示例 ${result.imported} 条。回抓包页切换新批次；未启动代理或调用模型。`); }
+                  catch (reason) { setMessage(String(reason)); }
+                  finally { endOperation(); }
+                }}><FileJson2 size={18} /><b>体验合成示例</b><span>离线导入，无需手机、证书或模型</span></button>
+                <button disabled={busy} onClick={() => void importJson("har")}><Upload size={18} /><b>导入 HAR</b><span>新建批次，保留来源与正文缺失状态</span></button>
+                <button disabled={busy} onClick={() => void importJson("openapi")}><FileJson2 size={18} /><b>导入 OpenAPI</b><span>本地校验状态码、必填字段和类型</span></button>
+                <button disabled={busy} onClick={() => void importJson("otlp")}><Activity size={18} /><b>导入 OTLP JSON</b><span>补齐服务端 Span、Links 与采样信息</span></button>
+                <button disabled={busy} onClick={() => void exportHar()}><Download size={18} /><b>导出原始 HAR</b><span>保留原文；上限2万条/20MiB，附未导出数量</span></button>
               </div>
               <div className="config-list">
                 {openApiConfigs.map((item) => (
                   <div className="config-row" key={item.id}>
                     <div><b>OpenAPI · {item.name}</b><span>{Object.keys(item.config.operations || {}).length} 个操作</span></div>
-                    <button className="button ghost compact" onClick={async () => {
-                      if (!selectedRequest) {
-                        setMessage("先在抓包页选择一条请求。");
-                        return;
-                      }
-                      const result = await call<Record<string, any>>("openapi.validate", { requestId: selectedRequest.id, configId: item.id });
+                    <button className="button ghost compact" disabled={busy || !selectedRequest} onClick={() => void performOperation(async () => {
+                      const result = await call<Record<string, any>>("openapi.validate", { requestId: selectedRequest!.id, configId: item.id });
                       setMessage(JSON.stringify(result, null, 2));
-                    }}>校验选中请求</button>
+                    })}>校验选中请求</button>
                   </div>
                 ))}
                 {imports.map((item) => (
@@ -483,11 +529,10 @@ export function WorkbenchDialog({
                   <label className="field"><span>Endpoint</span><input value={mcp.endpoint} onChange={(event) => setMcp({ ...mcp, endpoint: event.target.value })} placeholder="https://…/mcp" /></label>
                   <label className="field"><span>允许工具（逗号）</span><input value={mcp.allowedTools} onChange={(event) => setMcp({ ...mcp, allowedTools: event.target.value })} /></label>
                 </div>
-                <button className="button primary compact" disabled={!mcp.name || !mcp.endpoint} onClick={async () => {
+                <button className="button primary compact" disabled={busy || !mcp.name || !mcp.endpoint} onClick={() => void performOperation(async () => {
                   await call("mcp.save", { name: mcp.name, endpoint: mcp.endpoint, allowedTools: mcp.allowedTools.split(",").map((item) => item.trim()).filter(Boolean), enabled: true });
-                  await onChanged();
                   setMessage("MCP 服务已保存。");
-                }}>保存 MCP 服务</button>
+                }, true)}>保存 MCP 服务</button>
                 <div className="config-list">
                   {mcpServers.map((server) => (
                     <button className="config-row selectable" key={server.id} onClick={() => setMcpCall({ ...mcpCall, serverId: server.id, toolName: server.allowedTools[0] || "" })}>
@@ -496,19 +541,15 @@ export function WorkbenchDialog({
                   ))}
                 </div>
                 <div className="form-grid three">
-                  <label className="field"><span>MCP 服务</span><select value={mcpCall.serverId} onChange={(event) => setMcpCall({ ...mcpCall, serverId: event.target.value })}>{mcpServers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+                  <label className="field"><span>MCP 服务</span><Select value={mcpCall.serverId} onChange={(event) => setMcpCall({ ...mcpCall, serverId: event.target.value })}>{mcpServers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</Select></label>
                   <label className="field"><span>工具名</span><input value={mcpCall.toolName} onChange={(event) => setMcpCall({ ...mcpCall, toolName: event.target.value })} /></label>
-                  {debugType === "map-local" && <div className="form-grid two"><label className="field"><span>文件授权会话</span><select value={sharedSessionId} onChange={event => setSharedSessionId(event.target.value)}>{sharedSessions.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><button className="button ghost compact" disabled={!sharedSessionId || busy} onClick={async () => { try { const path = await pickLocalFile(); if (!path) return; await call("sessions.add-file", { sessionId: sharedSessionId, path }); setDebugPayload(JSON.stringify({ ...JSON.parse(debugPayload), filePath: path }, null, 2)); setMessage("已授权此文件，应用前仍会核对内容摘要。"); } catch (reason) { setMessage(String(reason)); } }}>选择并共享 Mock 文件</button></div>}
+
               <label className="field"><span>参数 JSON</span><input value={mcpCall.arguments} onChange={(event) => setMcpCall({ ...mcpCall, arguments: event.target.value })} /></label>
                 </div>
-                <button className="button ghost compact" onClick={async () => {
-                  try {
-                    const result = await call("mcp.call", { serverId: mcpCall.serverId, toolName: mcpCall.toolName, arguments: JSON.parse(mcpCall.arguments) });
-                    setMessage(JSON.stringify(result, null, 2));
-                  } catch (reason) {
-                    setMessage(String(reason));
-                  }
-                }}><Send size={13} /> 调用白名单工具</button>
+                <button className="button ghost compact" disabled={busy || !mcpCall.serverId || !mcpCall.toolName} onClick={() => void performOperation(async () => {
+                  const result = await call("mcp.call", { serverId: mcpCall.serverId, toolName: mcpCall.toolName, arguments: JSON.parse(mcpCall.arguments) });
+                  setMessage(JSON.stringify(result, null, 2));
+                })}><Send size={13} /> 调用白名单工具</button>
               </div>
 
               <div className="config-card">
@@ -517,13 +558,13 @@ export function WorkbenchDialog({
                 <div className="form-grid two">
                   <label className="field"><span>Trace ID</span><input value={observability.traceId} onChange={(event) => setObservability({ ...observability, traceId: event.target.value })} /></label>
                   <button className="button ghost compact self-end" onClick={async () => {
-                    setBusy(true);
+                    if (!beginOperation()) return;
                     try {
                       setObservabilityResult(await call("observability.query", observability));
                     } catch (reason) {
                       setMessage(String(reason));
                     } finally {
-                      setBusy(false);
+                      endOperation();
                     }
                   }}><RefreshCw size={13} /> 读取</button>
                 </div>
@@ -533,19 +574,19 @@ export function WorkbenchDialog({
               <div className="config-card">
                 <b>创建外部工单（预览后确认）</b>
                 <div className="form-grid two">
-                  <label className="field"><span>报告</span><select value={ticket.reportId} onChange={(event) => setTicket({ ...ticket, reportId: event.target.value })}>{reports.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
-                  <label className="field"><span>Webhook</span><input value={ticket.endpoint} onChange={(event) => setTicket({ ...ticket, endpoint: event.target.value })} /></label>
+                  <label className="field"><span>报告</span><ReportSelect key={reports[0]?.sessionId || runs[0]?.sessionId || "empty"} sessionId={reports[0]?.sessionId || runs[0]?.sessionId} recent={reports} value={ticket.reportId} onChange={reportId => setTicket({...ticket, reportId, preview: null})} /></label>
+                  <label className="field"><span>Webhook</span><input value={ticket.endpoint} onChange={(event) => setTicket({ ...ticket, endpoint: event.target.value, preview: null })} /></label>
                 </div>
                 <div className="settings-actions">
-                  <button className="button ghost compact" disabled={!ticket.reportId} onClick={async () => {
+                  <button className="button ghost compact" disabled={busy || !ticket.reportId} onClick={() => void performOperation(async () => {
                     const result = await call<Record<string, any>>("tickets.preview", ticket);
                     setTicket({ ...ticket, preview: result });
-                  }}>预览</button>
-                  <button className="button primary compact" disabled={!ticket.reportId || !ticket.endpoint || !ticket.preview?.id || ticket.preview.status !== "preview"} onClick={async () => {
+                  })}>预览</button>
+                  <button className="button primary compact" disabled={busy || !ticket.reportId || !ticket.endpoint || !ticket.preview?.id || ticket.preview.status !== "preview"} onClick={() => void performOperation(async () => {
                     const result = await call<Record<string, any>>("tickets.create", { ...ticket, ticketId: ticket.preview?.id });
                     setTicket((value) => ({ ...value, preview: result }));
                     setMessage(`工单状态：${result.status} ${JSON.stringify(result.result)}`);
-                  }}>确认创建</button>
+                  })}>确认创建</button>
                 </div>
                 {ticket.preview && <pre className="result-json">{JSON.stringify(ticket.preview, null, 2)}</pre>}
               </div>
@@ -556,8 +597,9 @@ export function WorkbenchDialog({
             <>
               <div className="settings-heading"><div><span className="eyebrow">PREVIEW · APPROVAL · RESTORE</span><h3>调试变更</h3></div></div>
               <div className="form-grid two">
-                <label className="field"><span>操作类型</span><select value={debugType} onChange={(event) => {
+                <label className="field"><span>操作类型</span><Select value={debugType} onChange={(event) => {
                   setDebugType(event.target.value);
+                  setDebugAction(null); setDebugVerification(null);
                   setDebugPayload(
                     event.target.value === "throttle"
                       ? JSON.stringify(throttle, null, 2)
@@ -567,11 +609,11 @@ export function WorkbenchDialog({
                           ? '{\n  "source": "https://api.example.com/v1/*",\n  "phase": "request",\n  "part": "header",\n  "action": "set",\n  "headerName": "X-QA",\n  "headerValue": "1"\n}'
                           : '{\n  "source": "https://api.example.com/v1/*",\n  "target": "http://127.0.0.1:3000/v1/"\n}'
                   );
-                }}><option value="map-remote">Map Remote</option><option value="map-local">Map Local</option><option value="rewrite">Rewrite</option><option value="throttle">弱网</option></select></label>
+                }}><option value="map-remote">Map Remote</option><option value="map-local">Map Local</option><option value="rewrite">Rewrite</option><option value="throttle">弱网</option></Select></label>
                 <button className="button ghost compact self-end" onClick={() => void previewDebug()} disabled={busy}><RefreshCw size={13} /> 生成预览</button>
               </div>
-              {debugType === "map-local" && <div className="form-grid two"><label className="field"><span>文件授权会话</span><select value={sharedSessionId} onChange={event => setSharedSessionId(event.target.value)}>{sharedSessions.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><button className="button ghost compact" disabled={!sharedSessionId || busy} onClick={async () => { try { const path = await pickLocalFile(); if (!path) return; await call("sessions.add-file", { sessionId: sharedSessionId, path }); setDebugPayload(JSON.stringify({ ...JSON.parse(debugPayload), filePath: path }, null, 2)); setMessage("已授权此文件，应用前仍会核对内容摘要。"); } catch (reason) { setMessage(String(reason)); } }}>选择并共享 Mock 文件</button></div>}
-              <label className="field"><span>参数 JSON</span><textarea className="large-textarea" value={debugPayload} onChange={(event) => setDebugPayload(event.target.value)} /></label>
+              {debugType === "map-local" && <div className="form-grid two"><label className="field"><span>文件授权会话</span><Select value={sharedSessionId} onChange={event => { setSharedSessionId(event.target.value); setDebugAction(null); setDebugVerification(null); }}>{sharedSessions.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}</Select></label><button className="button ghost compact" disabled={!sharedSessionId || busy} onClick={() => void shareMockFile()}>选择并共享 Mock 文件</button></div>}
+              <label className="field"><span>参数 JSON</span><textarea className="large-textarea" value={debugPayload} onChange={(event) => { setDebugPayload(event.target.value); setDebugAction(null); setDebugVerification(null); }} /></label>
               {debugAction && (
                 <div className="debug-preview">
                   <div className="debug-preview-head"><b>影响与差异</b><span>{debugAction.status}</span></div>
@@ -640,6 +682,7 @@ export function WorkbenchDialog({
           {tab === "runs" && (
             <>
               <div className="settings-heading"><div><span className="eyebrow">PERSISTED RUNS</span><h3>执行记录</h3></div></div>
+              <PerformancePanel runs={runs} />
               <div className="config-card">
                 <b>Agent 默认预算</b>
                 <p className="muted small">只限制下一轮 Run；正在执行的 Run 保留启动时预算。继续分析可在原预算上显式调整。</p>
@@ -680,7 +723,7 @@ export function WorkbenchDialog({
           )}
 
           {message && <pre className={`workbench-message ${/失败|错误|未知|拒绝|冲突/.test(message) ? "error" : ""}`}>{message}</pre>}
-        </div>
+        </fieldset>
       </div>
     </Dialog>
   );

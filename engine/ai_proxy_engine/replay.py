@@ -4,6 +4,7 @@ import base64
 import hashlib
 import http.client
 import json
+import re
 import ssl
 from typing import Any
 from urllib.parse import urlsplit
@@ -31,6 +32,8 @@ class ReplayService:
                 raise ValueError("请先预览，再确认发送")
             action = self.store.get_replay_action(action_id, internal=True)
             preview = action["request"]
+            if preview.get("composeJobId"):
+                raise ValueError("此预览属于Compose任务，请从该任务整体确认发送")
             if action["requestId"] != request_id:
                 raise ValueError("预览与请求不匹配")
             if owner_session and (preview.get("ownerSessionId") != owner_session or preview.get("ownerRunId") != owner_run):
@@ -49,44 +52,63 @@ class ReplayService:
             if action["requestId"] != request_id:
                 raise ValueError("预览与请求不匹配")
             return action
-        edits = dict(edits or {})
+        return self.preview(detail, edits or {}, override_url=override_url, owner_session=owner_session, owner_run=owner_run)
+
+    def preview(self, detail: dict[str, Any], edits: dict[str, Any], *, override_url: str = "",
+                owner_session: str | None = None, owner_run: str | None = None,
+                route_info: dict[str, Any] | None = None, job_id: str | None = None) -> dict[str, Any]:
+        if not isinstance(edits, dict) or set(edits)-{"url", "method", "headers", "body", "bodyBase64"}:
+            raise ValueError("请求编辑仅支持url/method/headers/body/bodyBase64")
         target = str(edits.get("url") or override_url or detail.get("actualUrl") or detail["url"])
         parts = urlsplit(target)
-        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username:
-            raise ValueError("重放目标必须是无内嵌凭据的 HTTP(S) URL")
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username is not None or parts.password is not None or parts.fragment or any(ord(c) < 33 for c in target):
+            raise ValueError("目标必须是无凭据、片段或空白控制字符的HTTP(S) URL")
+        _ = parts.port
         method = str(edits.get("method") or detail["method"]).upper()
-        if not method.isalpha():
-            raise ValueError("非法 HTTP 方法")
+        if not re.fullmatch(r"[A-Z]{1,32}", method) or method in {"CONNECT", "TRACE"}:
+            raise ValueError("请使用常规HTTP方法；Compose不支持CONNECT/TRACE")
         headers = edits.get("headers", detail["requestHeaders"])
+        if not isinstance(headers, list) or len(headers) > 200:
+            raise ValueError("Header须为数组且不超过200项")
         normalized = []
         for pair in headers:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                raise ValueError("Header 必须为 [name, value] 数组，允许重复")
+                raise ValueError("Header必须为[name,value]数组，允许重复")
             name, value = map(str, pair)
-            if any(c in name + value for c in "\r\n") or ":" in name or not name:
-                raise ValueError("非法 Header")
-            if name.lower() not in ("host", "content-length", "transfer-encoding", "connection"):
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-zA-Z-]+", name) or any(c in value for c in "\r\n\x00"):
+                raise ValueError("非法Header")
+            try:
+                value.encode("latin-1")
+            except UnicodeEncodeError:
+                raise ValueError("Header值需要HTTP可传输编码，请对非Latin-1文本显式编码") from None
+            if len(name)+len(value) > 65536:
+                raise ValueError("单个Header超过64KiB")
+            if name.lower() not in ("host", "content-length", "transfer-encoding", "connection", "proxy-authorization", "proxy-connection", "x-ai-proxy-compose-action", "x-ai-proxy-idempotency-key"):
                 normalized.append([name, value])
-        body = self.store.body_bytes(request_id, "request")
+        request_id = detail.get("id") or ""
+        if request_id and detail.get("requestTruncated") and not ({"body", "bodyBase64"} & edits.keys()):
+            raise ValueError("原正文被截断，无法完整重放；请显式提供完整替换正文")
+        body = self.store.body_bytes(request_id, "request") if request_id else None
+        if "body" in edits and "bodyBase64" in edits:
+            raise ValueError("正文文本与Base64不可同时指定")
         if "body" in edits:
             body = str(edits["body"]).encode()
         if "bodyBase64" in edits:
             body = base64.b64decode(edits["bodyBase64"], validate=True)
-        if body is not None and len(body) > 5 * 1024 * 1024:
-            raise ValueError("重放正文超过 5 MiB")
-        key = new_id("replay")
-        wire = {"url": target, "method": method, "headers": normalized, "body": base64.b64encode(body).decode() if body is not None else None}
+        if body is not None and len(body) > 5*1024*1024:
+            raise ValueError("请求正文超过5MiB")
+        route = route_info or {"mode": "direct"}
+        wire = {"url": target, "method": method, "headers": normalized, "body": base64.b64encode(body).decode() if body is not None else None, "route": route}
         digest = hashlib.sha256(json.dumps(wire, sort_keys=True).encode()).hexdigest()
-        preview = {
-            "requestId": request_id, "requestVersion": detail["version"], "method": method,
-            "url": self.redactor.url(target), "headers": self.redactor.headers(normalized),
-            "bodySize": len(body or b""), "bodyPreview": self._preview_body(body.decode("utf-8", "replace") if body else None, next((v for k, v in normalized if k.lower() == "content-type"), "")),
+        preview = {"kind": "captured" if request_id else "new", "requestId": request_id or None, "requestVersion": detail.get("version", 0),
+            "method": method, "url": self.redactor.url(target), "headers": self.redactor.headers(normalized),
+            "bodySize": len(body or b""), "bodyPreview": self._preview_body(body.decode("utf-8", "replace") if body else None, next((v for k,v in normalized if k.lower()=="content-type"), "")),
             "wireHash": digest, "configHash": self.store.config_hash(), "ownerSessionId": owner_session, "ownerRunId": owner_run,
-            "changes": {"url": target != detail["url"], "method": method != detail["method"], "headers": normalized != detail["requestHeaders"], "body": bool(set(edits) & {"body", "bodyBase64"})},
-            "boundary": "直接发送，不应用代理规则或弱网；不跟随重定向，不自动重试。可能产生真实业务写入。",
-            "_targetUrl": target, "_wire": wire,
-        }
-        return self.store.save_replay_action(request_id, detail["batchId"], {"status": "preview", "request": preview, "idempotencyKey": key})
+            "composeJobId": job_id, "route": {k:v for k,v in route.items() if k != "instance"},
+            "changes": {"url": target != detail["url"], "method": method != detail["method"], "headers": normalized != detail["requestHeaders"], "body": bool(set(edits)&{"body", "bodyBase64"})},
+            "boundary": "经过本地代理，使用当前已批准规则/弱网；HTTPS须已开启该Host解密。" if route["mode"] == "proxy" else "直连，不应用代理规则或弱网。",
+            "_targetUrl": target, "_wire": wire}
+        return self.store.save_replay_action(request_id, detail["batchId"], {"status": "preview", "request": preview, "idempotencyKey": new_id("send")})
 
     def _send(self, detail: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
         wire = action["request"]["_wire"]

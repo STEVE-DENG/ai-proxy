@@ -1,7 +1,7 @@
 {
   "name": "ai-proxy",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local HTTP(S) capture and AI-assisted QA workbench for macOS",
   "license": "MIT",
   "repository": {
@@ -22,7 +22,10 @@
     "tauri": "tauri",
     "engine:sync": "uv sync --locked --project engine",
     "engine:freeze": "bash scripts/freeze-engine.sh",
-    "app:build": "npm run build && tauri build"
+    "app:build": "node -e \"import('./scripts/engine-metadata.mjs').then(m => m.verifyEngine())\" && tauri build && node scripts/build-metadata.mjs",
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "version:set": "node scripts/set-version.mjs",
+    "app:install": "node scripts/install-app.mjs"
   },
   "dependencies": {
     "@fontsource-variable/manrope": "^5.2.7",
@@ -31,7 +34,9 @@
     "lucide-react": "^0.468.0",
     "qrcode": "^1.5.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.8.4",

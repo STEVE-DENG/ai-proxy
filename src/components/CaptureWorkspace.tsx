@@ -1,3 +1,8 @@
+import { Select } from "./Select";
+import { DirectoryTree } from "./DirectoryTree";
+import { attachFocusLayer } from "../lib/focus";
+import { PanelResize } from "./PanelResize";
+import { useRowHeight } from "../lib/display";
 import {
   Activity,
   ArrowUpRight,
@@ -14,6 +19,7 @@ import {
   ExternalLink,
   FileJson2,
   Filter,
+  Folder,
   GitCompareArrows,
   History,
   KeyRound,
@@ -140,6 +146,8 @@ interface Props {
   onExportHar: () => Promise<void>;
   onOpenWorkbench: (tab?: string) => void;
   onLoadRelations: () => Promise<void>;
+  relationsLoading: boolean;
+  relationsError: string | null;
   onAggregate: () => void;
   onDuplicates: () => void;
   onWaterfall: (traceId?: string) => void;
@@ -169,7 +177,8 @@ interface DirNode {
 
 function rootKey(request: RequestSummary): string {
   const defaultPort = request.scheme === "https" ? 443 : 80;
-  return `${request.scheme}://${request.host}${request.port === defaultPort ? "" : `:${request.port}`}`;
+  const host = request.host.includes(":") && !request.host.startsWith("[") ? `[${request.host}]` : request.host;
+  return `${request.scheme}://${host}${request.port === defaultPort ? "" : `:${request.port}`}`;
 }
 
 function buildDirectories(entries: RequestSummary[]): DirNode {
@@ -221,7 +230,7 @@ function VirtualRequestList({
   items,
   renderRow,
   selectedId,
-  rowHeight = 28,
+  rowHeight: configuredHeight,
   position,
   onPosition,
 }: {
@@ -232,9 +241,20 @@ function VirtualRequestList({
   position?: { scrollTop: number; selectedId?: string };
   onPosition?: (position: { scrollTop: number; selectedId?: string }) => void;
 }) {
+  const displayHeight = useRowHeight();
+  const rowHeight = configuredHeight || displayHeight;
   const [scrollTop, setScrollTop] = useState(position?.scrollTop || 0);
   const listRef = useRef<HTMLDivElement>(null);
   const scrolledSelection = useRef<string | undefined>(position?.selectedId);
+  const previousHeight = useRef(rowHeight);
+  useLayoutEffect(() => {
+    const node = listRef.current;
+    if (node && previousHeight.current !== rowHeight) {
+      const next = node.scrollTop / previousHeight.current * rowHeight;
+      node.scrollTop = next; setScrollTop(next);
+    }
+    previousHeight.current = rowHeight;
+  }, [rowHeight]);
   useLayoutEffect(() => {
     if (listRef.current) listRef.current.scrollTop = position?.scrollTop || 0;
   }, []);
@@ -686,6 +706,8 @@ export function CaptureWorkspace({
   onExportHar,
   onOpenWorkbench,
   onLoadRelations,
+  relationsLoading,
+  relationsError,
   onAggregate,
   onDuplicates,
   onWaterfall,
@@ -698,8 +720,10 @@ export function CaptureWorkspace({
   onAnalyze,
   onEvidenceSelect,
 }: Props) {
+  const rowHeight = useRowHeight();
   const [scenarioName, setScenarioName] = useState("");
   const [scenarioOpen, setScenarioOpen] = useState(false);
+  const [detailExpanded, setDetailExpanded] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [timelineDescending, setTimelineDescending] = useState(false);
   const [savedFilterId, setSavedFilterId] = useState("");
@@ -710,19 +734,9 @@ export function CaptureWorkspace({
   inlineCloseRef.current = onInlineClose;
   useEffect(() => {
     if (!inlineOpen) return;
-    const previous = document.activeElement as HTMLElement | null;
-    const targets = () => Array.from(inlinePanel.current?.querySelectorAll<HTMLElement>("button:not([disabled]), textarea, input, select") || []);
-    if (window.matchMedia("(max-width:1120px)").matches) targets()[0]?.focus();
-    const listener = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { event.preventDefault(); inlineCloseRef.current(); }
-      if (event.key === "Tab" && window.matchMedia("(max-width:1120px)").matches) {
-        const items = targets(), first = items[0], last = items.at(-1);
-        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
-        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
-      }
-    };
-    window.addEventListener("keydown", listener);
-    return () => { window.removeEventListener("keydown", listener); if (previous?.isConnected) previous.focus(); };
+    const element = inlinePanel.current;
+    if (!element) return;
+    return attachFocusLayer(element, () => inlineCloseRef.current(), () => window.matchMedia("(max-width:1120px)").matches);
   }, [inlineOpen]);
   const treeScroll = useRef<HTMLDivElement>(null);
   const [treeViewport, setTreeViewport] = useState({ top: uiState.scrollTop, height: 600 });
@@ -750,284 +764,154 @@ export function CaptureWorkspace({
     matchedCount: 0,
     batchCount: requestPage.batchCount,
   });
-  const [treeChildren, setTreeChildren] = useState<Record<string, CaptureTreeNode[]>>({});
+  type HostPage = { items: RequestSummary[]; nextOffset: number | null; offset: number; matchCount: number; loading: boolean; error?: string };
+  const [groupPages, setGroupPages] = useState<Record<string, HostPage>>({});
+  const pagesRef = useRef(groupPages);
+  pagesRef.current = groupPages;
   const [treeBusy, setTreeBusy] = useState(false);
   const [treeError, setTreeError] = useState<string | null>(null);
-  const [groupPages, setGroupPages] = useState<Record<string, {
-    items: RequestSummary[];
-    nextOffset: number | null;
-    matchCount: number;
-    loading: boolean;
-  }>>({});
-  const [rootPage, setRootPage] = useState<{ offset: number; nextOffset: number | null; count: number; partial: boolean }>({ offset: 0, nextOffset: null, count: 0, partial: false });
-  const [nodePages, setNodePages] = useState<Record<string, { offset: number; nextOffset: number | null }>>({});
-  const treeRequestGeneration = useRef(0);
-  const currentTreeScope = JSON.stringify([currentBatch.id, filters]);
-  const treeScopeRef = useRef(currentTreeScope);
-  treeScopeRef.current = currentTreeScope;
-  const treeSignalRef = useRef("");
-  const treeFilterRef = useRef("");
+  const [rootPage, setRootPage] = useState({ offset: 0, nextOffset: null as number | null, count: 0, partial: false });
+  const treeScopeKey = JSON.stringify([currentBatch.id, filters]);
+  const scopeVersion = useRef({ key: treeScopeKey, version: 0 });
+  if (scopeVersion.current.key !== treeScopeKey) scopeVersion.current = { key: treeScopeKey, version: scopeVersion.current.version + 1 };
+  const treeScope = `${treeScopeKey}:${scopeVersion.current.version}`;
+  const scopeRef = useRef(treeScope);
+  scopeRef.current = treeScope;
+  const rootFlight = useRef<string | null>(null);
+  const hostFlights = useRef(new Map<string, symbol>());
+  const selectedCapture = useRef(selected);
+  const visibleHosts = useRef(new Set<string>());
+  selectedCapture.current = selected;
 
   useEffect(() => {
-    if (uiState.view === "relations" && !relations) void onLoadRelations();
-  }, [uiState.view, relations, onLoadRelations]);
+    if (uiState.view === "relations" && !relations && !relationsLoading && !relationsError) void onLoadRelations();
+  }, [uiState.view, relations, relationsLoading, relationsError, onLoadRelations]);
+
+  const loadTreeGroup = useCallback(async (node: CaptureTreeNode, offset = 0, targetId?: string) => {
+    const scope = treeScope;
+    const flightKey = `${scope}:${node.key}`;
+    if (hostFlights.current.has(flightKey)) return;
+    const ticket = Symbol();
+    hostFlights.current.set(flightKey, ticket);
+    setGroupPages(pages => ({ ...pages, [node.key]: { ...(pages[node.key] || { items: [], nextOffset: null, offset, matchCount: node.count }), loading: true, error: undefined } }));
+    try {
+      const payload = await call<CaptureTreePayload>("requests.tree", {
+        batchId: currentBatch.id, filters, parent: { type: "host-requests", root: node.root, offset, targetId }, limit: 200,
+      });
+      if (scope !== scopeRef.current || hostFlights.current.get(flightKey) !== ticket) return;
+      updateUi({ treePageOffsets: { ...uiRef.current.treePageOffsets, [`requests:${node.key}`]: payload.offset || 0 } });
+      setGroupPages(pages => ({ ...pages, [node.key]: { items: payload.items || [], nextOffset: payload.nextOffset ?? null,
+        offset: payload.offset || 0, matchCount: payload.matchCount ?? node.count, loading: false } }));
+    } catch (reason) {
+      if (scope !== scopeRef.current) return;
+      setGroupPages(pages => ({ ...pages, [node.key]: { ...(pages[node.key] || { items: [], nextOffset: null, offset, matchCount: node.count }), loading: false, error: String(reason) } }));
+    } finally {
+      if (hostFlights.current.get(flightKey) === ticket) hostFlights.current.delete(flightKey);
+    }
+  }, [currentBatch.id, filters, treeScope]);
 
   const loadTreeRoot = useCallback(async (offset = 0, targetId?: string) => {
-    const generation = ++treeRequestGeneration.current;
+    const scope = treeScope;
+    if (rootFlight.current === scope) return;
+    rootFlight.current = scope;
     setTreeBusy(true);
     setTreeError(null);
     try {
       const payload = await call<CaptureTreePayload>("requests.tree", {
-        batchId: currentBatch.id,
-        filters,
-        parent: { type: filters.query.trim() ? "search" : "root", offset, targetId },
-        limit: 600,
+        batchId: currentBatch.id, filters, parent: { type: "hosts", offset, targetId }, limit: 600,
       });
-      if (generation !== treeRequestGeneration.current) return;
-      setRootPage({ offset: payload.offset || 0, nextOffset: payload.nextOffset ?? null, count: payload.nodeCount || 0, partial: Boolean(payload.truncated || payload.coverage.partial) });
+      if (scope !== scopeRef.current) return;
+      setRootPage({ offset: payload.offset || 0, nextOffset: payload.nextOffset ?? null, count: payload.nodeCount || 0, partial: false });
       updateUi({ treePageOffsets: { ...uiRef.current.treePageOffsets, root: payload.offset || 0 } });
-      setNodePages({});
-      setTreeRoot({
-        nodes: payload.nodes || [],
-        matchedCount: payload.coverage.matchedCount,
-        batchCount: payload.coverage.batchCount,
-      });
-      setTreeChildren({});
-      const filterKey = JSON.stringify([currentBatch.id, filters]);
-      if (treeFilterRef.current !== filterKey) setGroupPages({});
-      treeFilterRef.current = filterKey;
-    } catch (reason) {
-      if (generation === treeRequestGeneration.current) setTreeError(String(reason));
-    } finally {
-      if (generation === treeRequestGeneration.current) setTreeBusy(false);
-    }
-  }, [currentBatch.id, filters]);
-
-  useEffect(() => {
-    if (!currentBatch.id) return;
-    void loadTreeRoot(uiRef.current.treePageOffsets?.root || 0).catch(() => setTreeBusy(false));
-  }, [currentBatch.id, filters, loadTreeRoot]);
-
-  useEffect(() => {
-    if (!currentBatch.id) return;
-    const signal = `${requestPage.matchCount}:${requests[0]?.id || ""}:${requests.at(-1)?.id || ""}`;
-    const previous = treeSignalRef.current;
-    treeSignalRef.current = signal;
-    if (previous && previous !== signal) {
-      void loadTreeRoot(uiRef.current.treePageOffsets?.root || 0).catch(() => setTreeBusy(false));
-    }
-  }, [currentBatch.id, loadTreeRoot, requestPage.matchCount, requests]);
-
-  const loadTreeChildren = useCallback(async (node: CaptureTreeNode, offset = 0, force = false, seekPath?: string) => {
-    if (!force && treeChildren[node.key]) return treeChildren[node.key];
-    if (node.type === "group") return [];
-    const parent = node.type === "host"
-      ? { type: "host", root: node.root, path: "" }
-      : { type: "directory", root: node.root, path: node.path || "/" };
-    const generation = treeRequestGeneration.current;
-    const payload = await call<CaptureTreePayload>("requests.tree", {
-      batchId: currentBatch.id,
-      filters,
-      parent: { ...parent, offset: !force ? uiRef.current.treePageOffsets?.[node.key] || offset : offset, targetPath: seekPath ?? (!force && uiRef.current.treePageOffsets?.[node.key] == null ? selected?.path : null) },
-      limit: 200,
-    });
-    if (generation !== treeRequestGeneration.current) return [];
-    setNodePages(current => ({ ...current, [node.key]: { offset: payload.offset || 0, nextOffset: payload.nextOffset ?? null } }));
-    updateUi({ treePageOffsets: { ...uiRef.current.treePageOffsets, [node.key]: payload.offset || 0 } });
-    const children = payload.nodes || [];
-    setTreeChildren((current) => ({ ...current, [node.key]: children }));
-    return children;
-  }, [currentBatch.id, filters, treeChildren, selected?.id]);
-
-  const loadTreeGroup = useCallback(async (node: CaptureTreeNode, offset = 0) => {
-    const generation = treeScopeRef.current;
-    const current = groupPages[node.key];
-    if (current?.loading) return;
-    const savedPosition = uiRef.current.listPositions?.[node.key];
-    const savedTop = savedPosition?.scrollTop || 0;
-    // Restore the visible window without reloading thousands of earlier instances.
-    const rebase = offset === 0 ? Math.max(0, Math.floor(savedTop / 28) - 10) : 0;
-    const initialOffset = offset === 0 ? (savedPosition?.offset || 0) + rebase : offset;
-    const initialTop = offset === 0 ? savedTop - rebase * 28 : 0;
-    setGroupPages((pages) => ({
-      ...pages,
-      [node.key]: {
-        items: offset > 0 ? current?.items || [] : [],
-        nextOffset: current?.nextOffset ?? null,
-        matchCount: current?.matchCount || node.count,
-        loading: true,
-      },
-    }));
-    try {
-      const payload = await call<CaptureTreePayload>("requests.tree", {
-        batchId: currentBatch.id,
-        filters,
-        parent: {
-          type: "group",
-          root: node.root,
-          method: node.method,
-          path: node.path,
-          offset: initialOffset,
-          targetId: offset === 0 && selected && savedPosition?.selectedId !== selected.id && selected.method === node.method && selected.path.split("?")[0] === node.path ? selected.id : null,
-        },
-        limit: 200,
-      });
-      if (generation !== treeScopeRef.current) return;
-      if (offset === 0) updateUi({ listPositions: { ...uiRef.current.listPositions, [node.key]: { scrollTop: initialTop, selectedId: savedPosition?.selectedId, offset: payload.offset || 0 } } });
-      setGroupPages((pages) => {
-        const existing = offset > 0 ? pages[node.key]?.items || [] : [];
-        const known = new Set(existing.map((item) => item.id));
-        return {
-          ...pages,
-          [node.key]: {
-            items: [...existing, ...(payload.items || []).filter((item) => !known.has(item.id))],
-            nextOffset: payload.nextOffset ?? null,
-            matchCount: payload.matchCount ?? node.count,
-            loading: false,
-          },
-        };
-      });
-    } catch (reason) {
-      if (generation !== treeScopeRef.current) return;
-      setTreeError(String(reason));
-      setGroupPages((pages) => ({
-        ...pages,
-        [node.key]: {
-          items: pages[node.key]?.items || [],
-          nextOffset: pages[node.key]?.nextOffset ?? null,
-          matchCount: pages[node.key]?.matchCount || node.count,
-          loading: false,
-        },
-      }));
-    }
-  }, [currentBatch.id, filters, groupPages, selected?.id]);
-
-  const positionedTreeSelection = useRef(uiState.selectedId);
-  const positionedTreeBatch = useRef(currentBatch.id);
-  if (positionedTreeBatch.current !== currentBatch.id) {
-    positionedTreeBatch.current = currentBatch.id;
-    positionedTreeSelection.current = uiState.selectedId;
-  }
-  useEffect(() => {
-    if (!selected || selected.id === positionedTreeSelection.current || treeBusy || filters.query || uiState.view !== "structure" || !treeRoot.nodes.length) return;
-    const defaultPort = selected.scheme === "https" ? 443 : 80;
-    const root = `${selected.scheme}://${selected.host}${selected.port === defaultPort ? "" : `:${selected.port}`}`;
-    const rootNode = treeRoot.nodes.find(node => node.root === root);
-    if (!rootNode) { void loadTreeRoot(0, selected.id); return; }
-    let cancelled = false;
-    const seek = async () => {
-      const path = selected.path.split("?")[0] || "/";
-      const openNodes: Record<string, boolean> = {};
-      let node: CaptureTreeNode | undefined = rootNode;
-      for (let depth = 0; node && depth < 64 && !cancelled; depth++) {
-        openNodes[node.key] = true;
-        if (node.type === "group") break;
-        const matches = (child: CaptureTreeNode) => child.type === "group"
-          ? child.method === selected.method && child.path === path
-          : path === child.path || path.startsWith(`${(child.path || "").replace(/\/$/, "")}/`);
-        let children: CaptureTreeNode[] = treeChildren[node.key];
-        if (!children?.some(matches)) children = await loadTreeChildren(node, 0, true, path);
-        if (cancelled) return;
-        node = children.find(matches);
-      }
-      if (!cancelled && node?.type === "group") {
-        positionedTreeSelection.current = selected.id;
-        updateUi({ openNodes: { ...uiRef.current.openNodes, ...openNodes } });
-      }
-    };
-    void seek().catch(reason => { if (!cancelled) setTreeError(String(reason)); });
-    return () => { cancelled = true; };
-  }, [selected?.id, treeBusy, treeRoot.nodes, uiState.view]);
-
-  useEffect(() => {
-    if (!selected || treeError || uiState.view !== "structure") return;
-    const path = selected.path.split("?")[0] || "/";
-    const port = selected.port === (selected.scheme === "https" ? 443 : 80) ? "" : `:${selected.port}`;
-    const root = `${selected.scheme}://${selected.host}${port}`;
-    const key = `group:${root}|${selected.method}|${path}`;
-    if (uiRef.current.listPositions?.[key]?.selectedId === selected.id) return;
-    const page = groupPages[key];
-    if (!page?.loading && !page?.items.some(item => item.id === selected.id)) {
-      void loadTreeGroup({ key, type: "group", root, path, method: selected.method, count: 1, failureCount: 0, inProgressCount: 0, latestStatus: selected.status, latestStartedAt: selected.startedAt });
-    }
-  }, [selected?.id, uiState.view, treeRoot.nodes, groupPages, treeError]);
-
-  useEffect(() => {
-    if (!searchExpanded || uiState.view !== "structure") return;
-    for (const node of treeRoot.nodes) {
-      if (node.type === "group" && !groupPages[node.key]) void loadTreeGroup(node);
-    }
-  }, [searchExpanded, uiState.view, treeRoot.nodes, groupPages, loadTreeGroup]);
-
-  useEffect(() => {
-    if (uiState.view !== "structure") return;
-    let cancelled = false;
-    const hydrate = async (nodes: CaptureTreeNode[]): Promise<void> => {
-      for (const node of nodes) {
-        if (cancelled || !uiState.openNodes[node.key]) continue;
-        if (node.type === "group") {
-          if (!groupPages[node.key]?.loading && !groupPages[node.key]?.items.length) {
-            void loadTreeGroup(node).catch(() => undefined);
-          }
-          continue;
+      setTreeRoot({ nodes: payload.nodes || [], matchedCount: payload.coverage.matchedCount, batchCount: payload.coverage.batchCount });
+      const target = selectedCapture.current;
+      const refreshNodes = (payload.nodes || []).filter(node =>
+        (filters.query.trim() || uiRef.current.openNodes[node.key]) && (visibleHosts.current.has(node.key) || target && rootKey(target) === node.root));
+      void (async () => {
+        for (let start = 0; start < refreshNodes.length && scope === scopeRef.current; start += 4) {
+          await Promise.all(refreshNodes.slice(start, start + 4).map(node => {
+            const page = pagesRef.current[node.key];
+            if (page?.error) return Promise.resolve();
+            return loadTreeGroup(node, page?.offset ?? uiRef.current.treePageOffsets?.[`requests:${node.key}`] ?? 0);
+          }));
         }
-        const children = treeChildren[node.key] ?? await loadTreeChildren(node);
-        if (!cancelled) await hydrate(children);
-      }
-    };
-    void hydrate(treeRoot.nodes);
-    return () => { cancelled = true; };
-  }, [
-    groupPages,
-    loadTreeChildren,
-    loadTreeGroup,
-    treeChildren,
-    treeRoot.nodes,
-    uiState.openNodes,
-    uiState.view,
-  ]);
-
-  const hosts = useMemo(() => {
-    const map = new Map<string, RequestSummary[]>();
-    for (const request of requests) {
-      const key = rootKey(request);
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(request);
+      })();
+    } catch (reason) {
+      if (scope === scopeRef.current) setTreeError(String(reason));
+    } finally {
+      if (rootFlight.current === scope) rootFlight.current = null;
+      if (scope === scopeRef.current) setTreeBusy(false);
     }
-    const focus = new Set(uiState.focusHosts);
-    return [...map.entries()]
-      .map(([key, items]) => ({ key, items, focused: focus.has(key) }))
-      .sort((a, b) => Number(b.focused) - Number(a.focused) || a.key.localeCompare(b.key));
-  }, [requests, uiState.focusHosts]);
+  }, [currentBatch.id, filters, treeScope, loadTreeGroup]);
+
+  useEffect(() => {
+    setGroupPages({});
+    pagesRef.current = {};
+    setTreeRoot({ nodes: [], matchedCount: 0, batchCount: requestPage.batchCount });
+    void loadTreeRoot(uiRef.current.treePageOffsets?.root || 0);
+  }, [treeScope, loadTreeRoot]);
+
+  useEffect(() => {
+    if (uiState.view !== "structure" || treeError) return;
+    const timer = window.setTimeout(() => void loadTreeRoot(rootPage.offset), 500);
+    return () => window.clearTimeout(timer);
+  }, [requestPage.matchCount, capture.running, uiState.view, loadTreeRoot, rootPage.offset, treeError]);
+
+  useEffect(() => {
+    if (!capture.running || uiState.view !== "structure" || treeError) return;
+    const timer = window.setInterval(() => void loadTreeRoot(rootPage.offset), 2000);
+    return () => window.clearInterval(timer);
+  }, [capture.running, uiState.view, loadTreeRoot, rootPage.offset, treeError]);
+
+  useEffect(() => {
+    const updates = new Map(requests.map(item => [item.id, item]));
+    setGroupPages(pages => {
+      let changed = false;
+      const next = { ...pages };
+      for (const [key, page] of Object.entries(pages)) {
+        const items = page.items.map(item => {
+          const update = updates.get(item.id);
+          if (update && update.version !== item.version) { changed = true; return update; }
+          return item;
+        });
+        next[key] = { ...page, items };
+      }
+      return changed ? next : pages;
+    });
+  }, [requests]);
+
+  const positionedSelection = useRef(selected ? `${treeScope}:${selected.id}` : "");
+  const rootSelectionSeek = useRef("");
+  useEffect(() => {
+    if (!selected || uiState.view !== "structure") return;
+    const positionKey = `${treeScope}:${selected.id}`;
+    if (positionedSelection.current === positionKey) return;
+    const node = treeRoot.nodes.find(item => item.root === rootKey(selected));
+    if (!node) {
+      if (!treeBusy && !treeError && rootSelectionSeek.current !== positionKey) {
+        rootSelectionSeek.current = positionKey;
+        void loadTreeRoot(0, selected.id);
+      }
+      return;
+    }
+    if (!uiRef.current.openNodes[node.key]) updateUi({ openNodes: { ...uiRef.current.openNodes, [node.key]: true } });
+    const page = pagesRef.current[node.key];
+    if (page?.items.some(item => item.id === selected.id)) positionedSelection.current = positionKey;
+    else if (!page?.loading && !page?.error) void loadTreeGroup(node, 0, selected.id);
+  }, [selected?.id, treeRoot.nodes, uiState.view, loadTreeGroup, loadTreeRoot, groupPages, treeScope, treeBusy, treeError]);
 
   const toggleNode = (key: string, node?: CaptureTreeNode) => {
     const opening = !(uiState.openNodes[key] ?? false);
     updateUi({ openNodes: { ...uiState.openNodes, [key]: opening } });
-    if (!opening || !node) return;
-    if (node.type === "group") void loadTreeGroup(node);
-    else void loadTreeChildren(node);
+    if (opening && node && !pagesRef.current[key]) void loadTreeGroup(node, uiRef.current.treePageOffsets?.[`requests:${key}`] || 0);
   };
-
   const collapseAll = () => updateUi({ openNodes: {} });
-
-  const expandLevel = async (level: "host" | "directory" | "group") => {
-    const next: Record<string, boolean> = { ...uiState.openNodes };
-    const visit = async (nodes: CaptureTreeNode[], depth: number): Promise<void> => {
-      if (depth > 16) return;
-      for (const node of nodes) {
-        next[node.key] = true;
-        if (node.type === "group") {
-          if (level === "group") void loadTreeGroup(node);
-          else next[node.key] = false;
-          continue;
-        }
-        if (level === "host") continue;
-        const children = await loadTreeChildren(node);
-        await visit(children, depth + 1);
-      }
-    };
-    await visit(treeRoot.nodes.filter((node) => node.type !== "group"), 0);
-    updateUi({ openNodes: next });
+  const expandLevel = async (_level: string) => {
+    updateUi({ openNodes: { ...uiState.openNodes, ...Object.fromEntries(treeRoot.nodes.map(node => [node.key, true])) } });
+    // Bound parallel reads rather than issuing hundreds of IPC requests together.
+    for (let start = 0; start < treeRoot.nodes.length; start += 4) {
+      await Promise.all(treeRoot.nodes.slice(start, start + 4).map(node => loadTreeGroup(node)));
+    }
   };
 
   const toggleMulti = (requestId: string) => {
@@ -1067,75 +951,6 @@ export function CaptureWorkspace({
     ? activeLocator.direction
     : activeEvidence?.direction || "";
 
-  const renderDirectory = (host: string, node: DirNode, depth = 0): React.ReactNode => {
-    const children = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
-    const groups = [...node.groups].sort((a, b) => `${a.method}${a.path}`.localeCompare(`${b.method}${b.path}`));
-    return (
-      <>
-        {children.map((child) => {
-          let compressed = child;
-          const labels = [child.name];
-          while (compressed.groups.length === 0 && compressed.children.size === 1) {
-            compressed = [...compressed.children.values()][0];
-            labels.push(compressed.name);
-          }
-          const hasGrandchildren = compressed.children.size > 0 || compressed.groups.length > 0;
-          const nodeKey = `dir:${host}:${compressed.path}`;
-          const open = searchExpanded || Boolean(uiState.openNodes[nodeKey]);
-          const failed = nodeEntries(compressed).some(
-            (item) => (item.status || 0) >= 400 || item.error || item.ruleError,
-          );
-          return (
-            <div className="directory-group" key={nodeKey}>
-              {hasGrandchildren && (
-                <button
-                  data-tree-key={nodeKey}
-                  className={`directory-row ${open ? "open" : ""}`}
-                  style={{ paddingLeft: 13 + depth * 13 }}
-                  onClick={() => toggleNode(nodeKey)}
-                >
-                  {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                  <span className="directory-mark">{labels.length > 1 ? "↳" : "⌑"}</span>
-                  <span className="directory-name">{labels.join(" / ")}</span>
-                  {failed && <span className="tiny-failure-dot" />}
-                </button>
-              )}
-              {(open || !hasGrandchildren) && renderDirectory(host, compressed, hasGrandchildren ? depth + 1 : depth)}
-            </div>
-          );
-        })}
-        {groups.map((group) => {
-          const groupKey = `group:${host}:${group.method}:${group.path}`;
-          const expanded = Boolean(uiState.openNodes[groupKey]);
-          const failureCount = group.entries.filter(
-            (item) => (item.status || 0) >= 400 || item.error || item.ruleError,
-          ).length;
-          const latest = group.entries[group.entries.length - 1];
-          if (group.entries.length === 1) {
-            return renderRequest(group.entries[0], depth);
-          }
-          return (
-            <div className="request-group" key={groupKey}>
-              <button
-                className={`group-row ${expanded ? "open" : ""}`}
-                style={{ paddingLeft: 20 + depth * 13 }}
-                onClick={() => toggleNode(groupKey)}
-              >
-                {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                <span className={`method-badge ${methodTone(group.method)}`}>{group.method}</span>
-                <span className="group-path">{group.path || "/"}</span>
-                <span className="group-count">{group.entries.length}</span>
-                {failureCount > 0 && <span className="group-fail">{failureCount} FAIL</span>}
-                <span className={`status-code ${statusTone(latest.status)}`}>{latest.status || "…"}</span>
-              </button>
-              {expanded && group.entries.map((request) => renderRequest(request, depth + 1))}
-            </div>
-          );
-        })}
-      </>
-    );
-  };
-
   const renderRequest = (request: RequestSummary, depth: number): React.ReactNode => (
     <button
       className={`request-row ${selected?.id === request.id ? "active" : ""} ${selectedSet.has(request.id) ? "multi" : ""}`}
@@ -1155,19 +970,14 @@ export function CaptureWorkspace({
         {selectedSet.has(request.id) && <Check size={9} />}
       </span>
       <span className={`method-badge ${methodTone(request.method)}`}>{request.method}</span>
-      <span className="request-query">{shortPath(request.path).replace(request.path.split("?")[0], "") || "/"}</span>
+      <span className="request-query" title={request.path}>{request.path || "/"}</span>
       {request.requestState === "in_progress" && <LoaderCircle className="spin request-progress" size={11} />}
-      <span className={`status-code ${statusTone(request.status)}`}>
-        {request.status || (request.requestState === "in_progress" ? "…" : request.encrypted ? "TLS" : "—")}
+      <span title={request.error || undefined} className={`status-code ${request.error ? "bad" : statusTone(request.status)}`}>
+        {request.error ? (request.error.includes("超时") ? "超时" : "失败") : request.status || (request.requestState === "in_progress" ? "…" : request.encrypted ? "TLS" : "—")}
       </span>
     </button>
   );
 
-  const renderNodePager = (node: CaptureTreeNode) => {
-    const page = nodePages[node.key];
-    if (!page || page.offset === 0 && page.nextOffset == null) return null;
-    return <div className="qa-actions"><button className="button ghost compact" disabled={page.offset === 0} onClick={() => void loadTreeChildren(node, Math.max(0, page.offset-200), true).catch(reason => setTreeError(String(reason)))}>上一页目录</button><span>第 {Math.floor(page.offset/200)+1} 页</span><button className="button ghost compact" disabled={page.nextOffset == null} onClick={() => void loadTreeChildren(node, page.nextOffset!, true).catch(reason => setTreeError(String(reason)))}>下一页目录</button></div>;
-  };
   const renderLazyNode = (node: CaptureTreeNode, depth = 0): React.ReactNode => {
     const open = searchExpanded || Boolean(uiState.openNodes[node.key]);
     if (node.type === "host") {
@@ -1222,97 +1032,48 @@ export function CaptureWorkspace({
         </div>
       );
     }
-    if (node.type === "directory") {
-      return (
-        <div className="directory-group" key={node.key}>
-          <button
-            data-tree-key={node.key}
-            className={`directory-row ${open ? "open" : ""}`}
-            style={{ paddingLeft: 13 + depth * 13 }}
-            onClick={() => toggleNode(node.key, node)}
-          >
-            {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-            <span className="directory-mark">{node.name?.includes("/") ? "↳" : "⌑"}</span>
-            <span className="directory-name">{node.name}</span>
-            <span className="group-count">{node.count}</span>
-            {node.failureCount > 0 && <span className="tiny-failure-dot" />}
-          </button>
-        </div>
-      );
-    }
-    const page = groupPages[node.key];
-    return (
-      <div className="request-group" key={node.key}>
-        <button
-          data-tree-key={node.key}
-          className={`group-row ${open ? "open" : ""}`}
-          style={{ paddingLeft: 20 + depth * 13 }}
-          onClick={() => toggleNode(node.key, node)}
-        >
-          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-          <span className={`method-badge ${methodTone(node.method || "")}`}>{node.method}</span>
-          <span className="group-path">{node.path || "/"}</span>
-          <span className="group-count">{page?.matchCount || node.count}</span>
-          {node.failureCount > 0 && <span className="group-fail">{node.failureCount} FAIL</span>}
-          <span className={`status-code ${statusTone(node.latestStatus)}`}>{node.latestStatus || "…"}</span>
-        </button>
-      </div>
-    );
+    return null;
   };
-
-  const renderGroupInstances = (node: CaptureTreeNode, depth: number) => {
+  const renderNodePager = (node: CaptureTreeNode) => {
     const page = groupPages[node.key];
-    return <div className="lazy-group-instances">
-            {page?.loading && !page.items.length ? (
-              <div className="tree-node-loading"><LoaderCircle className="spin" size={12} /> 按需加载请求实例…</div>
-            ) : page?.items.length ? (
-              <>
-                <VirtualRequestList
-                  items={page.items}
-                  selectedId={selected?.id}
-                  position={uiState.listPositions?.[node.key]}
-                  onPosition={position => updateUi({ listPositions: { ...uiRef.current.listPositions, [node.key]: { ...uiRef.current.listPositions?.[node.key], ...position } } })}
-                  renderRow={(request) => renderRequest(request, depth + 1)}
-                />
-                {page.nextOffset != null && (
-                  <button className="load-more compact" onClick={() => void loadTreeGroup(node, page.nextOffset!)}>
-                    加载更多 · {page.items.length} / {page.matchCount}
-                  </button>
-                )}
-              </>
-            ) : (
-              <div className="empty-detail">该请求组没有可读取实例。</div>
-            )}
-          </div>;
+    if (!page) return null;
+    return <div className="host-request-pager">
+      {page.error ? <><span role="alert">{page.error}</span><button disabled={page.loading} onClick={() => void loadTreeGroup(node, page.offset)}>重试</button></>
+        : <><button disabled={page.loading || page.offset === 0} onClick={() => void loadTreeGroup(node, Math.max(0, page.offset - 200))}>上一页</button>
+          <span>{page.matchCount ? `${page.offset + 1}–${page.offset + page.items.length} / ${page.matchCount}` : "暂无请求"}</span>
+          <button disabled={page.loading || page.nextOffset == null} onClick={() => void loadTreeGroup(node, page.nextOffset!)}>下一页</button></>}
+    </div>;
   };
 
   const timeline = [...requests].sort((a, b) =>
     timelineDescending ? b.startedAt - a.startedAt : a.startedAt - b.startedAt,
   );
   const sortedRoots = [...treeRoot.nodes].sort((a, b) => Number(uiState.focusHosts.includes(b.root)) - Number(uiState.focusHosts.includes(a.root)) || a.key.localeCompare(b.key));
-  type TreeRow = { key: string; node: CaptureTreeNode; depth: number; kind: "node" | "instances" | "pager" | "loading"; top: number; height: number };
+  type TreeRow = { key: string; node: CaptureTreeNode; request?: RequestSummary; depth: number; kind: "node" | "request" | "pager" | "loading"; top: number; height: number };
   const treeRows: TreeRow[] = [];
   let treeHeight = 0;
-  const appendTreeRow = (node: CaptureTreeNode, depth: number, kind: TreeRow["kind"], height: number) => {
-    treeRows.push({ key: `${kind}:${node.key}`, node, depth, kind, top: treeHeight, height });
+  const appendTreeRow = (node: CaptureTreeNode, kind: TreeRow["kind"], height: number, request?: RequestSummary) => {
+    treeRows.push({ key: request?.id || `${kind}:${node.key}`, node, request, depth: 0, kind, top: treeHeight, height });
     treeHeight += height;
   };
-  const flattenTree = (nodes: CaptureTreeNode[], depth = 0) => {
-    for (const node of nodes) {
-      appendTreeRow(node, depth, "node", node.type === "host" ? 31 : 25);
-      if (!(searchExpanded || uiState.openNodes[node.key])) continue;
-      if (node.type === "group") {
-        const page = groupPages[node.key];
-        appendTreeRow(node, depth, "instances", page?.items.length ? Math.min(320, page.items.length * 28) + (page.nextOffset != null ? 38 : 0) : 48);
-      } else if (treeChildren[node.key]) {
-        flattenTree(treeChildren[node.key], depth + 1);
-        const page = nodePages[node.key];
-        if (page && (page.offset > 0 || page.nextOffset != null)) appendTreeRow(node, depth, "pager", 44);
-      } else appendTreeRow(node, depth, "loading", 30);
-    }
-  };
-  if (uiState.view === "structure") flattenTree(sortedRoots);
+  if (uiState.view === "structure") for (const node of sortedRoots) {
+    appendTreeRow(node, "node", rowHeight);
+    if (!(searchExpanded || uiState.openNodes[node.key])) continue;
+    const page = groupPages[node.key];
+    if (!page) { appendTreeRow(node, "loading", rowHeight); continue; }
+    for (const request of page.items) appendTreeRow(node, "request", rowHeight, request);
+    if (page.loading && !page.items.length) appendTreeRow(node, "loading", rowHeight);
+    if (page.error || page.offset > 0 || page.nextOffset != null) appendTreeRow(node, "pager", rowHeight + 10);
+  }
   const virtualRows = treeRows.filter(row => row.top + row.height >= treeViewport.top - 320 && row.top <= treeViewport.top + treeViewport.height + 320);
+  visibleHosts.current = new Set(virtualRows.map(row => row.node.key));
+  const visibleHostKey = [...visibleHosts.current].join("\n");
+  useEffect(() => {
+    if (uiState.view !== "structure") return;
+    for (const node of sortedRoots) {
+      if (visibleHosts.current.has(node.key) && (searchExpanded || uiRef.current.openNodes[node.key]) && !pagesRef.current[node.key]) void loadTreeGroup(node, uiRef.current.treePageOffsets?.[`requests:${node.key}`] || 0);
+    }
+  }, [visibleHostKey, uiState.openNodes, uiState.view, treeRoot.nodes, loadTreeGroup]);
   const restoreKey = `${currentBatch.id}:${uiState.view}:${JSON.stringify(filters)}`;
   const restoreState = useRef({ key: restoreKey, top: uiState.scrollTop, done: false });
   if (restoreState.current.key !== restoreKey) restoreState.current = { key: restoreKey, top: uiState.scrollTop, done: false };
@@ -1333,7 +1094,7 @@ export function CaptureWorkspace({
   }
   useLayoutEffect(() => {
     if (!selected || selected.id === revealedSelection.current || uiState.view !== "structure") return;
-    const row = treeRows.find(item => item.kind === "instances" && groupPages[item.node.key]?.items.some(request => request.id === selected.id));
+    const row = treeRows.find(item => item.request?.id === selected.id);
     const element = treeScroll.current;
     if (!row || !element) return;
     revealedSelection.current = selected.id;
@@ -1344,20 +1105,14 @@ export function CaptureWorkspace({
     }
   }, [selected?.id, treeRows, groupPages, uiState.view]);
   const keyboardRows: Array<{ key: string; request?: RequestSummary; node?: CaptureTreeNode; parent?: string }> = [];
-  const collectRows = (nodes: CaptureTreeNode[], parent?: string) => {
-    for (const node of nodes) {
-      keyboardRows.push({ key: node.key, node, parent });
-      if (searchExpanded || uiState.openNodes[node.key]) {
-        if (node.type === "group") keyboardRows.push(...(groupPages[node.key]?.items || []).map(request => ({ key: request.id, request, parent: node.key })));
-        else collectRows(treeChildren[node.key] || [], node.key);
-      }
-    }
-  };
-  if (uiState.view === "structure") collectRows(sortedRoots);
+  if (uiState.view === "structure") for (const row of treeRows) {
+    if (row.kind === "node") keyboardRows.push({ key: row.node.key, node: row.node });
+    if (row.request) keyboardRows.push({ key: row.request.id, request: row.request, parent: row.node.key });
+  }
   else (uiState.view === "timeline" ? timeline : requests).forEach(request => keyboardRows.push({ key: request.id, request }));
   const focusRow = (row: typeof keyboardRows[number]) => {
     if (row.request) onSelect(row.request);
-    const virtualRow = treeRows.find(item => row.request ? item.kind === "instances" && item.node.key === row.parent : item.kind === "node" && item.node.key === row.key);
+    const virtualRow = treeRows.find(item => row.request ? item.request?.id === row.request.id : item.kind === "node" && item.node.key === row.key);
     const element = treeScroll.current;
     if (element && virtualRow && (virtualRow.top < element.scrollTop || virtualRow.top + virtualRow.height > element.scrollTop + element.clientHeight)) {
       restoreState.current.done = true;
@@ -1367,7 +1122,9 @@ export function CaptureWorkspace({
     requestAnimationFrame(() => requestAnimationFrame(() => treeScroll.current?.querySelector<HTMLElement>(`[data-tree-key="${CSS.escape(row.key)}"]`)?.focus({ preventScroll: false })));
   };
   const onKeyDown = (event: React.KeyboardEvent) => {
+    if (uiState.view === "directories") return;
     if ((event.target as HTMLElement).closest("input,textarea,select")) return;
+    if ((event.target as HTMLElement).closest('[role="separator"]')) return;
     if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End", "j", "k"].includes(event.key)) return;
     if (!keyboardRows.length) return;
     event.preventDefault();
@@ -1386,7 +1143,7 @@ export function CaptureWorkspace({
   };
 
   return (
-    <div className={`capture-workspace ${inlineOpen ? "with-inline-ai" : ""}`}>
+    <div className={`capture-workspace ${inlineOpen ? "with-inline-ai" : ""} ${detailExpanded ? "detail-expanded" : ""}`} style={{"--tree-row-height": `${rowHeight}px`} as React.CSSProperties}>
       <section className="capture-toolbar">
         <div className="capture-controls">
           {capture.running ? (
@@ -1404,6 +1161,7 @@ export function CaptureWorkspace({
               <Play size={14} fill="currentColor" /> {busy ? "正在启动" : "开始抓包"}
             </button>
           )}
+          <button className="button ghost compact" onClick={() => setDetailExpanded(current => !current)}><Columns3 size={14} />{detailExpanded ? "返回请求列表" : "详情全宽"}</button>
           <span className="toolbar-separator" />
           <button className="button ghost compact" onClick={() => setScenarioOpen((value) => !value)}>
             <Tags size={14} /> {activeScenario ? `结束 ${activeScenario.name}` : "开始场景"}
@@ -1449,10 +1207,10 @@ export function CaptureWorkspace({
             <>
               <Tags size={14} />
               <input value={scenarioName} placeholder="场景名称，例如：提交订单失败" onChange={(event) => setScenarioName(event.target.value)} />
-              <select value={filters.sourceIp} onChange={(event) => onFilters({ ...filters, sourceIp: event.target.value })}>
+              <Select value={filters.sourceIp} onChange={(event) => onFilters({ ...filters, sourceIp: event.target.value })}>
                 <option value="">全部设备</option>
                 {filterOptions.devices.map((device) => <option key={device}>{device}</option>)}
-              </select>
+              </Select>
               <button className="button primary compact" disabled={!scenarioName.trim()} onClick={async () => {
                 await onScenarioStart(scenarioName.trim(), filters.sourceIp);
                 setScenarioName("");
@@ -1466,17 +1224,18 @@ export function CaptureWorkspace({
 
       <section className="filterbar">
         <div className="filter-search"><Search size={14} /><input value={filters.query} placeholder="URL / Host / Path" onChange={(event) => onFilters({ ...filters, query: event.target.value })} /></div>
-        <div className="filter-select"><Filter size={13} /><select value={filters.method} onChange={(event) => onFilters({ ...filters, method: event.target.value })}><option value="">全部方法</option><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>CONNECT</option></select></div>
-        <div className="filter-select"><select value={filters.status} onChange={(event) => onFilters({ ...filters, status: event.target.value })}><option value="">全部状态</option><option value="2xx">2xx</option><option value="3xx">3xx</option><option value="4xx">4xx</option><option value="5xx">5xx</option></select></div>
-        <div className="filter-select"><select value={filters.host} onChange={(event) => onFilters({ ...filters, host: event.target.value })}><option value="">全部 Host</option>{filterOptions.hosts.map((host) => <option key={host}>{host}</option>)}</select></div>
-        <div className="filter-select device-filter"><select value={filters.sourceIp} onChange={(event) => onFilters({ ...filters, sourceIp: event.target.value })}><option value="">全部设备</option>{filterOptions.devices.map((ip) => <option key={ip}>{ip}</option>)}</select></div>
+        <div className="filter-select"><Filter size={13} /><Select value={filters.method} onChange={(event) => onFilters({ ...filters, method: event.target.value })}><option value="">全部方法</option><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>CONNECT</option></Select></div>
+        <div className="filter-select"><Select value={filters.status} onChange={(event) => onFilters({ ...filters, status: event.target.value })}><option value="">全部状态</option><option value="2xx">2xx</option><option value="3xx">3xx</option><option value="4xx">4xx</option><option value="5xx">5xx</option></Select></div>
+        <div className="filter-select"><Select value={filters.host} onChange={(event) => onFilters({ ...filters, host: event.target.value })}><option value="">全部 Host</option>{filterOptions.hosts.map((host) => <option key={host}>{host}</option>)}</Select></div>
+        <div className="filter-select device-filter"><Select value={filters.sourceIp} onChange={(event) => onFilters({ ...filters, sourceIp: event.target.value })}><option value="">全部设备</option>{filterOptions.devices.map((ip) => <option key={ip}>{ip}</option>)}</Select></div>
         <label className="filter-check"><input type="checkbox" checked={filters.errorsOnly} onChange={(event) => onFilters({ ...filters, errorsOnly: event.target.checked })} /> 仅异常</label>
-        <div className="batch-picker"><History size={13} /><select value={currentBatch.id} onChange={(event) => void onBatchSelect(event.target.value)}>{batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.label} · {batch.request_count ?? batch.requestCount ?? 0}</option>)}</select></div>
+        <div className="batch-picker"><History size={13} /><Select value={currentBatch.id} onChange={(event) => void onBatchSelect(event.target.value)}>{batches.map((batch) => <option key={batch.id} value={batch.id}>{batch.label} · {batch.request_count ?? batch.requestCount ?? 0}</option>)}</Select></div>
       </section>
 
       <section className="capture-subbar">
         <div className="view-tabs">
           <button className={uiState.view === "structure" ? "active" : ""} onClick={() => updateUi({ view: "structure" })}><ListTree size={13} /> 结构</button>
+          <button className={uiState.view === "directories" ? "active" : ""} onClick={() => updateUi({ view: "directories" })}><Folder size={13} /> 目录折叠</button>
           <button className={uiState.view === "timeline" ? "active" : ""} onClick={() => updateUi({ view: "timeline" })}><Columns3 size={13} /> 时序</button>
           <button className={uiState.view === "relations" ? "active" : ""} onClick={() => updateUi({ view: "relations" })}><Link2 size={13} /> 关联</button>
         </div>
@@ -1506,7 +1265,7 @@ export function CaptureWorkspace({
           {requestPage.newSinceScope > 0 && <span className="new-capture-pill"><Sparkles size={11} /> 快照后新增 {requestPage.newSinceScope}</span>}
         </div>
         <div className="saved-filter-controls">
-          <select
+          <Select
             value={savedFilterId}
             onChange={(event) => {
               const id = event.target.value;
@@ -1517,7 +1276,7 @@ export function CaptureWorkspace({
           >
             <option value="">常用筛选</option>
             {savedFilters.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-          </select>
+          </Select>
           <button
             title="保存当前筛选"
             onClick={() => setSavingFilter(value => !value)}
@@ -1548,9 +1307,8 @@ export function CaptureWorkspace({
               <button onClick={() => onMultiSelected([])}>清除</button>
             </>
           )}
-          <button onClick={collapseAll}>全部收起</button>
-          <button onClick={() => void expandLevel("directory")}>展开目录</button>
-          <button onClick={() => void expandLevel("group")}>展开请求组</button>
+          {uiState.view !== "directories" && <><button onClick={collapseAll}>全部收起</button>
+          <button onClick={() => void expandLevel("host")}>展开 Host</button></>}
           <button onClick={onAggregate}><Database size={12} /> 聚合</button>
           <button onClick={onDuplicates}><RotateCcw size={12} /> 重复模式</button>
           <button onClick={() => void onExportHar()}><Download size={12} /> HAR</button>
@@ -1561,12 +1319,13 @@ export function CaptureWorkspace({
 
       <div className="capture-body">
         <aside className="request-tree" onKeyDown={onKeyDown} tabIndex={0}>
+          <PanelResize name="调整请求树宽度" variable="--tree-width" initial={36} />
           <div className="tree-head">
-            <span>{uiState.view === "structure" ? "SCHEME / HOST / DIRECTORY" : uiState.view === "timeline" ? "TIMELINE" : "RELATIONS"}</span>
-            <span>{requests.length}</span>
+            <span>{uiState.view === "structure" ? "HOST / 请求" : uiState.view === "directories" ? "HOST / 目录 / 请求" : uiState.view === "timeline" ? "TIMELINE" : "RELATIONS"}</span>
+            <span>{requestPage.matchCount}</span>
           </div>
           <div
-            className="tree-scroll"
+            className={`tree-scroll ${uiState.view === "directories" ? "directory-container" : ""}`}
             ref={treeScroll}
             onWheel={() => { restoreState.current.done = true; }}
             onPointerDown={() => { restoreState.current.done = true; }}
@@ -1576,7 +1335,7 @@ export function CaptureWorkspace({
               if (restoreState.current.done) updateUi({ scrollTop: top });
             }}
           >
-            {treeError ? (
+            {uiState.view === "directories" ? <DirectoryTree key={treeScopeKey} batchId={currentBatch.id} filters={filters} running={capture.running} revision={requestPage.matchCount} rowHeight={rowHeight} selected={selected} seekNonce={evidenceTarget?.requestId === selected?.id ? evidenceTarget?.nonce || 0 : 0} ui={uiState} onUi={updateUi} renderRequest={renderRequest} /> : treeError ? (
               <div className="tree-empty" role="alert"><h3>结构树加载失败</h3><p>{treeError}</p><button className="button ghost compact" onClick={() => void loadTreeRoot()}>重试</button></div>
             ) : requestPage.matchCount === 0 && !treeBusy ? (
               <div className="tree-empty">
@@ -1584,7 +1343,7 @@ export function CaptureWorkspace({
                 <h3>{requestPage.batchCount > 0 && requestPage.matchCount === 0 ? "当前筛选没有匹配请求" : capture.running ? "等待第一个请求" : "抓包工作区还未启动"}</h3>
                 <p>{requestPage.batchCount > 0 ? `批次中有 ${requestPage.batchCount} 条请求，当前筛选范围为空。` : "启动代理不会自动修改系统设置。"}</p>
                 {requestPage.batchCount > 0 ? (
-                  <button className="button ghost compact" onClick={() => onFilters({ ...filters, query: "", method: "", status: "", sourceIp: "", host: "", errorsOnly: false })}>清除筛选</button>
+                  <button className="button ghost compact" onClick={() => onFilters({ query: "", method: "", status: "", sourceIp: "", host: "", environment: "", traceId: "", errorsOnly: false, startedAfter: null, startedBefore: null })}>清除筛选</button>
                 ) : !capture.running ? (
                   <button className="button primary compact" onClick={onStart}><Play size={14} /> 开始抓包</button>
                 ) : null}
@@ -1598,9 +1357,9 @@ export function CaptureWorkspace({
                   {virtualRows.map(row => (
                     <div className="virtual-tree-block" key={row.key} style={{ top: row.top, height: row.height }}>
                       {row.kind === "node" ? renderLazyNode(row.node, row.depth)
-                        : row.kind === "instances" ? renderGroupInstances(row.node, row.depth)
+                        : row.kind === "request" && row.request ? renderRequest(row.request, 0)
                         : row.kind === "pager" ? renderNodePager(row.node)
-                        : <div className="tree-node-loading"><LoaderCircle className="spin" size={12} /> 按需加载目录…</div>}
+                        : <div className="tree-node-loading"><LoaderCircle className="spin" size={12} /> 正在加载请求…</div>}
                     </div>
                   ))}
                 </div>
@@ -1612,7 +1371,7 @@ export function CaptureWorkspace({
                 <button className="timeline-sort" onClick={() => setTimelineDescending((value) => !value)}>
                   <TimerReset size={12} /> {timelineDescending ? "最新在前" : "最早在前"}
                 </button>
-                <VirtualRequestList key={`${currentBatch.id}:${timelineDescending}`} items={timeline} rowHeight={28} selectedId={selected?.id}
+                <VirtualRequestList key={`${currentBatch.id}:${timelineDescending}`} items={timeline} selectedId={selected?.id}
                   position={uiState.listPositions?.[`timeline:${timelineDescending}`]}
                   onPosition={position => updateUi({ listPositions: { ...uiRef.current.listPositions, [`timeline:${timelineDescending}`]: position } })}
                   renderRow={(request) => (
@@ -1634,7 +1393,10 @@ export function CaptureWorkspace({
             ) : (
               <div className="relation-panel">
                 {!relations ? (
-                  <div className="tree-empty"><LoaderCircle className="spin" /><p>正在计算 Trace、业务键和候选关系…</p></div>
+                  <div className="tree-empty">
+                    {relationsLoading ? <><LoaderCircle className="spin" /><p>正在计算 Trace、业务键和候选关系…</p></>
+                      : <><p role="alert">{relationsError || "尚未计算关联"}</p><button className="button ghost compact" onClick={() => void onLoadRelations()}>重新计算</button></>}
+                  </div>
                 ) : (
                   <>
                     <div className="relation-summary">
@@ -1686,16 +1448,16 @@ export function CaptureWorkspace({
                 )}
               </div>
             )}
-            {requestPage.nextCursor && (
+            {uiState.view !== "structure" && uiState.view !== "directories" && requestPage.nextCursor && (
               <button className="load-more" onClick={() => void onLoadMore()}>
                 加载更多 · 已加载 {requests.length} / {requestPage.matchCount}
               </button>
             )}
           </div>
           <div className="tree-footer">
-            <span>{requestPage.sort === "desc" ? "完成与开始时间稳定排序" : "时间正序"}</span>
+            <span>{uiState.view === "structure" ? "Host 分组 · 最新在前" : uiState.view === "directories" ? "目录可折叠 · 每次请求独立保留" : uiState.view === "timeline" ? timelineDescending ? "时间倒序" : "时间正序" : "关联视图"}</span>
             <span className={capture.captureLoss ? "capture-loss" : ""}>
-              {capture.captureLoss ? `记录丢失 ${capture.captureLoss} 条 · ${capture.lastRecordLossReason || "请看错误通知"}` : agentBusy ? "Agent 运行中" : capture.paused ? "记录已暂停" : `写入队列 ${capture.recordQueueDepth ?? 0} / ${capture.recordQueueLimit ?? 1000}`}
+              {capture.captureLoss ? `记录写入丢失 ${capture.captureLoss} 次 · ${capture.lastRecordLossReason === "persist-failed" ? "持久化失败" : capture.lastRecordLossReason === "queue-full" ? "队列已满" : "请看错误通知"}` : agentBusy ? "Agent 运行中" : capture.paused ? "记录已暂停" : `写入队列 ${capture.recordQueueDepth ?? 0} / ${capture.recordQueueLimit ?? 1000}`}
             </span>
           </div>
         </aside>
@@ -1811,6 +1573,7 @@ export function CaptureWorkspace({
                     />
                     <div className="section-heading spaced"><h3>Request Body</h3><BodyStateBadge state={detail.bodyStates.request} /></div>
                     <BodyPanel
+                      key={`${detail.id}:${detail.version}:request`}
                       requestId={detail.id}
                       direction="request"
                       text={detail.requestBodyText}
@@ -1831,6 +1594,7 @@ export function CaptureWorkspace({
                     />
                     <div className="section-heading spaced"><h3>Response Body</h3><BodyStateBadge state={detail.bodyStates.response} /></div>
                     <BodyPanel
+                      key={`${detail.id}:${detail.version}:response`}
                       requestId={detail.id}
                       direction="response"
                       text={detail.responseBodyText}
@@ -1900,7 +1664,8 @@ export function CaptureWorkspace({
         </main>
 
         {inlineOpen && (
-          <aside ref={inlinePanel} className="inline-ai" aria-label="就地 AI 分析">
+          <aside ref={inlinePanel} className="inline-ai" aria-label="就地 AI 分析" tabIndex={-1}>
+            <PanelResize name="调整就地分析宽度" variable="--inline-width" initial={29} reverse />
             <div className="inline-ai-head">
               <div><span className="eyebrow">LOCAL HARNESS</span><h3>就地分析</h3></div>
               <div className="inline-ai-actions">

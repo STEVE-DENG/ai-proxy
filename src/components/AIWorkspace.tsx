@@ -1,3 +1,9 @@
+import { RunHistory } from "./RunHistory";
+import { agentCommands, parseAgentCommand } from "../lib/agentCommands";
+import { call, type AgentIssue } from "../lib/api";
+import { AgentContextPanel, compressSessionContext, type InputPreview } from "./AgentContextPanel";
+import { PanelResize } from "./PanelResize";
+import { DiagnosticCopy } from "./DiagnosticCopy";
 import {
   ArrowUp,
   Bot,
@@ -23,7 +29,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   AnalysisRun,
   AnalysisScope,
@@ -64,7 +70,7 @@ interface Props {
   onAutoApply: (enabled: boolean) => void;
   refs: RequestRef[];
   onRefs: (refs: RequestRef[]) => void;
-  onSend: (text: string) => Promise<void>;
+  onSend: (text: string) => Promise<boolean>;
   onStop: () => Promise<void>;
   onNew: () => Promise<void>;
   onSelect: (id: string) => Promise<void>;
@@ -73,10 +79,11 @@ interface Props {
   onPickFile: () => Promise<void>;
   onApproval: (approvalId: string, approved: boolean) => Promise<void>;
   busy: boolean;
-  error: string | null;
+  error: AgentIssue | null;
   runs: AnalysisRun[];
   activeRunId: string | null;
-  reports: Report[];
+  reports: import("../types").ReportSummary[];
+  reportTotal: number;
   events: RunEvent[];
   evidence: Evidence[];
   scope: AnalysisScope | null;
@@ -85,9 +92,14 @@ interface Props {
   mode: "analysis" | "debug";
   onMode: (mode: "analysis" | "debug") => void;
   scopeChoice: ScopeChoice;
+  pendingScopeSummary: string;
+  sourceRevision: string;
   onScopeChoice: (choice: ScopeChoice) => void;
+  onAdjustScope: () => void;
   onRunSelect: (run: AnalysisRun) => Promise<void>;
   onContinue: (run: AnalysisRun) => Promise<void>;
+  onFreshScope: (run: AnalysisRun) => Promise<void>;
+  onPreviewContext: (text: string) => Promise<InputPreview>;
   onGenerateReport: (run: AnalysisRun) => Promise<void>;
   onSaveReport: (report: Report) => Promise<void>;
   onDeleteReport: (report: Report) => Promise<void>;
@@ -111,28 +123,15 @@ const TOOL_LABELS: Record<string, string> = {
   preview_debug_action: "预览调试变更",
   apply_debug_action: "应用调试变更",
   restore_debug_action: "恢复调试变更",
-  replay_request: "预览或重放请求",
+  replay_request: "预览或重放请求", get_phone_connection_status: "手机连接诊断", compose_request: "编辑与重复预览",
+  get_composed_request_status: "读取重复请求状态", compose_new_request: "新建请求预览", execute_composed_requests: "发送请求预览", preview_advanced_repeat: "高级重复预览",
+  execute_advanced_repeat: "执行高级重复", manage_capture_proxy: "管理代理", prepare_phone_connection: "准备手机接入",
+  authorize_proxy_address: "来源地址授权", run_local_shell: "本机Shell",
 };
 
+const MarkdownText = lazy(() => import("./MarkdownText"));
 function InlineText({ text }: { text: string }) {
-  const parts = text.split(/(```[\s\S]*?```|`[^`\n]+`|\*\*[^*]+\*\*)/g);
-  return (
-    <>
-      {parts.map((part, index) => {
-        if (part.startsWith("```")) {
-          const body = part.replace(/^```[^\n]*\n?/, "").replace(/```$/, "");
-          return <pre key={index}><code>{body}</code></pre>;
-        }
-        if (part.startsWith("`") && part.endsWith("`")) {
-          return <code key={index}>{part.slice(1, -1)}</code>;
-        }
-        if (part.startsWith("**") && part.endsWith("**")) {
-          return <strong key={index}>{part.slice(2, -2)}</strong>;
-        }
-        return <span key={index}>{part}</span>;
-      })}
-    </>
-  );
+  return <Suspense fallback={<span>{text}</span>}><MarkdownText text={text} /></Suspense>;
 }
 
 function MessageBody({ message }: { message: Message }) {
@@ -193,7 +192,7 @@ function InvestigationTrace({
 }) {
   const [open, setOpen] = useState(false);
   const visible = events.filter((event) =>
-    ["model_step", "tool_call", "tool_result", "approval_required", "approval_resolved", "evidence", "budget_exhausted", "run_failed", "run_stopped", "run_completed"].includes(event.eventType),
+    ["cache_policy", "model_usage", "context_compacted", "model_step", "tool_call", "tool_result", "approval_required", "approval_resolved", "evidence", "budget_exhausted", "run_failed", "run_stopped", "run_completed"].includes(event.eventType),
   );
   if (!visible.length) return null;
   return (
@@ -212,7 +211,10 @@ function InvestigationTrace({
               <span className="trace-type">{
                 event.eventType === "tool_call" ? "TOOL CALL" :
                 event.eventType === "tool_result" ? "TOOL RESULT" :
-                event.eventType === "model_step" ? "MODEL STEP" :
+                event.eventType === "model_step" ? "模型输出" :
+                event.eventType === "model_usage" ? "模型用量" :
+                event.eventType === "cache_policy" ? "缓存策略" :
+                event.eventType === "context_compacted" ? "上下文整理" :
                 event.eventType === "approval_required" ? "WAIT APPROVAL" :
                 event.eventType === "approval_resolved" ? "APPROVAL" :
                 event.eventType === "evidence" ? "EVIDENCE" :
@@ -223,7 +225,9 @@ function InvestigationTrace({
                   ? event.payload.toolName
                   : event.eventType === "evidence"
                     ? event.payload.summary
-                    : event.payload.message || event.payload.error || event.payload.delta || event.status || ""}
+                    : event.eventType === "model_usage"
+                      ? `输入 ${event.payload.inputTokens ?? "未知"} / 输出 ${event.payload.outputTokens ?? "未知"} · 缓存读 ${event.payload.cacheReadTokens ?? "未知"} / 写 ${event.payload.cacheWriteTokens ?? "未知"} · 首输出 ${event.payload.firstOutputMs ?? "未知"}ms / 总耗时 ${event.payload.durationMs}ms`
+                      : event.payload.message || event.payload.error || event.payload.delta || event.status || ""}
               </span>
               <time>{new Date(event.createdAt).toLocaleTimeString("zh-CN")}</time>
               {(event.payload.args || event.payload.result) && (
@@ -266,6 +270,7 @@ export function AIWorkspace({
   runs,
   activeRunId,
   reports,
+  reportTotal,
   events,
   evidence,
   scope,
@@ -274,9 +279,14 @@ export function AIWorkspace({
   mode,
   onMode,
   scopeChoice,
+  pendingScopeSummary,
+  sourceRevision,
   onScopeChoice,
+  onAdjustScope,
   onRunSelect,
   onContinue,
+  onFreshScope,
+  onPreviewContext,
   onGenerateReport,
   onSaveReport,
   onDeleteReport,
@@ -287,25 +297,64 @@ export function AIWorkspace({
 }: Props) {
   const draftKey = `ai-proxy-draft:${session.id}`;
   const [text, setText] = useState(() => localStorage.getItem(draftKey) || "");
+  const visibleSession = useRef(session.id); visibleSession.current = session.id;
   const draftSession = useRef(session.id);
   useEffect(() => {
     if (draftSession.current !== session.id) { draftSession.current = session.id; setText(localStorage.getItem(draftKey) || ""); return; }
-    localStorage.setItem(draftKey, text);
+    try { localStorage.setItem(draftKey, text); } catch { /* Keep the current input editable when disk quota is exhausted. */ }
   }, [session.id, text]);
   const [providerOpen, setProviderOpen] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(() => localStorage.getItem("ai-proxy-rail-collapsed") === "true");
   const [reportId, setReportId] = useState<string | null>(null);
   const [draftReport, setDraftReport] = useState<Report | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const followOutput = useRef(true);
+  const submitting = useRef(false);
+  const scrollSession = useRef(session.id);
+  useLayoutEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+    let saved: {top: number; follow: boolean} | null = null;
+    try { saved = JSON.parse(sessionStorage.getItem(`ai-proxy-reading:${session.id}`) || "null"); } catch { /* Start at the latest message when no position exists. */ }
+    scrollSession.current = session.id;
+    followOutput.current = saved?.follow ?? true;
+    node.scrollTop = saved && !saved.follow ? saved.top : node.scrollHeight;
+    setNewContent(false);
+  }, [session.id, activeRunId]);
+  const [sending, setSending] = useState(false);
+  const [commandMessage, setCommandMessage] = useState("");
+  const [commandIndex, setCommandIndex] = useState(0);
+  const [commandDismissed, setCommandDismissed] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const composing = useRef(false);
+  const commandQuery = text.trim().toLowerCase();
+  const suggestions = !commandDismissed && commandQuery.startsWith("/") && !commandQuery.startsWith("//") && !/\s/.test(commandQuery)
+    ? agentCommands.filter(item => [item.name, ...item.aliases, item.label].some(value => value.includes(commandQuery === "/" ? "" : commandQuery))) : [];
+  const chooseCommand = (name: string) => { setText(name); setCommandDismissed(true); setCommandIndex(0); inputRef.current?.focus(); };
+  useEffect(() => { setCommandMessage(""); setCommandDismissed(false); setCommandIndex(0); }, [session.id]);
+  const [stopping, setStopping] = useState(false);
+  const [newContent, setNewContent] = useState(false);
   const provider = providers.find((item) => item.id === selectedProviderId);
   const currentRun = runs.find((item) => item.id === activeRunId) ?? runs[0] ?? null;
   const sessionApprovals = approvals.filter((item) => item.sessionId === session.id && item.runId === currentRun?.id);
-  const report = reports.find((item) => item.id === reportId) ?? null;
+  const [report, setReport] = useState<Report | null>(null);
+  const [reportError, setReportError] = useState("");
+  const reportUpdated = reports.find(item => item.id === reportId)?.updatedAt;
+  useEffect(() => {
+    let live = true; setReport(null); setDraftReport(null); setReportError("");
+    if (reportId) void call<Report>("reports.get", {reportId}).then(value => {
+      if (live && visibleSession.current === session.id && value.sessionId === session.id) setReport(value);
+    }).catch(reason => { if (live && visibleSession.current === session.id) setReportError(String(reason)); });
+    return () => { live = false; };
+  }, [reportId, session.id, reportUpdated]);
+  useEffect(() => { setReportId(null); }, [session.id]);
   const interrupted = currentRun && ["failed", "stopped", "interrupted", "budget_exhausted"].includes(currentRun.status);
   const facts = useMemo(() => evidence, [evidence]);
 
   useEffect(() => {
     const node = scrollRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
+    if (node && followOutput.current) node.scrollTop = node.scrollHeight;
+    else if (node) setNewContent(true);
   }, [session.messages.length, live?.content, live?.tools.length, sessionApprovals.length, currentRun?.status]);
 
   useEffect(() => {
@@ -314,7 +363,7 @@ export function AIWorkspace({
       const saved = JSON.parse(localStorage.getItem(`ai-proxy-report-draft:${report.id}`) || "null");
       setDraftReport(saved?.baseUpdatedAt === report.updatedAt ? saved.report : { ...report });
     } catch { setDraftReport({ ...report }); }
-  }, [report?.id]);
+  }, [report?.id, report?.updatedAt]);
 
   useEffect(() => {
     if (!draftReport || !report || draftReport.id !== report.id) return;
@@ -322,11 +371,38 @@ export function AIWorkspace({
   }, [draftReport, report?.id, report?.updatedAt]);
 
   const submit = async () => {
-    const content = text.trim();
-    if (!content || busy) return;
-    setText("");
-    setProviderOpen(false);
-    await onSend(content);
+    const original = text.trim();
+    if (!original || submitting.current) return;
+    const parsed = parseAgentCommand(original);
+    if (parsed.kind === "error") { setCommandMessage(parsed.message); return; }
+    if (busy && (parsed.kind === "text" || parsed.command.idle)) { setCommandMessage("请先等待或停止当前任务。"); return; }
+    submitting.current = true; setSending(true); setProviderOpen(false); setCommandDismissed(true);
+    const sentSession = session.id;
+    const valid = () => visibleSession.current === sentSession;
+    try {
+      setCommandMessage("");
+      let accepted = true;
+      if (parsed.kind === "command") {
+        switch (parsed.command.name) {
+          case "/help": onOpenWorkbench("help"); break;
+          case "/stop": await onStop(); break;
+          case "/new": await onNew(); break;
+          case "/compress": {
+            const value = await compressSessionContext(sentSession);
+            if (valid()) setCommandMessage(value.message || "压缩完成"); break;
+          }
+          case "/context": window.dispatchEvent(new Event("ai-proxy-open-context")); break;
+          case "/sessions": setRailCollapsed(false); localStorage.setItem("ai-proxy-rail-collapsed", "false"); requestAnimationFrame(() => document.querySelector<HTMLButtonElement>(".session-select")?.focus()); break;
+          case "/models": if (providers.length) setProviderOpen(true); else onSettings(); break;
+        }
+      } else accepted = await onSend(parsed.text);
+      if (accepted && valid()) {
+        setText(value => value.trim() === original ? "" : value);
+        followOutput.current = true;
+        try { sessionStorage.setItem(`ai-proxy-reading:${sentSession}`, JSON.stringify({top: 0, follow: true})); } catch { /* Input remains usable without storage. */ }
+      }
+    } catch (reason) { if (valid()) setCommandMessage(String(reason)); }
+    finally { submitting.current = false; setSending(false); }
   };
 
   const saveReport = async () => {
@@ -336,8 +412,9 @@ export function AIWorkspace({
   };
 
   return (
-    <div className="ai-workspace">
+    <div className={`ai-workspace ${railCollapsed ? "rail-collapsed" : ""}`}>
       <aside className="session-rail">
+        <PanelResize name="调整会话列表宽度" variable="--rail-width" initial={18} />
         <div className="rail-head">
           <span>会话</span>
           <button className="icon-action small" title="新会话" onClick={() => void onNew()}><Plus size={16} /></button>
@@ -359,20 +436,7 @@ export function AIWorkspace({
           ))}
         </div>
 
-        <div className="run-history">
-          <div className="rail-label"><History size={12} /> 分析记录 / 报告</div>
-          {runs.slice(0, 12).map((run) => (
-            <button className={`run-history-item ${run.status}`} key={run.id} onClick={() => void onRunSelect(run)}>
-              <span>{run.scope.batchLabel || run.batchId || "分析"}</span>
-              <small>{run.status} · {new Date(run.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</small>
-            </button>
-          ))}
-          {reports.slice(0, 8).map((item) => (
-            <button className="report-history-item" key={item.id} onClick={() => setReportId(item.id)}>
-              <FileText size={11} /><span>{item.title}</span>
-            </button>
-          ))}
-        </div>
+        <RunHistory key={session.id} sessionId={session.id} revision={JSON.stringify([runs.map(run => [run.id, run.status]), activeRunId])} reports={reports} reportTotal={reportTotal} onRun={onRunSelect} onReport={setReportId} />
 
         <div className="rail-footer">
           <div className="file-stack">
@@ -390,15 +454,18 @@ export function AIWorkspace({
 
       <main className="conversation">
         <div className="conversation-head">
+          <button className="button ghost compact" onClick={() => setRailCollapsed(current => { localStorage.setItem("ai-proxy-rail-collapsed", String(!current)); return !current; })}>{railCollapsed ? "展开会话列表" : "收起会话列表"}</button>
           <div>
-            <span className="eyebrow">HARNESSED REACT SESSION</span>
-            <h1>{session.title}</h1>
+            <h1 title={session.title}>{session.title}</h1>
           </div>
           <div className={`agent-state ${live?.status === "running" ? "running" : ""}`}>
-            <span className={`live-dot ${live?.status === "running" ? "on" : ""}`} /> {live?.status === "running" ? "Agent 正在执行" : currentRun?.status || "Agent 空闲"}
+            <span className={`live-dot ${live?.status === "running" ? "on" : ""}`} /> {busy ? ({ waiting_approval: "等待你的批准", executing_tool: "查询工具", preparing: "准备样本", running: "等待模型 / 整理结论" } as Record<string, string>)[currentRun?.status || "running"] || "调查进行中" : ({completed: "分析完成", failed: "执行失败", stopped: "已停止", interrupted: "运行已中断", budget_exhausted: "预算已用尽"} as Record<string, string>)[currentRun?.status || ""] || "等待输入"}
           </div>
         </div>
 
+        <AgentContextPanel key={`${session.id}:${selectedProviderId}:${provider?.protocol}:${provider?.baseUrl}:${provider?.model}`} sessionId={session.id} runId={currentRun?.id} busy={busy} providerId={selectedProviderId}
+          inputRevision={JSON.stringify([text, refs, pendingScopeSummary, sourceRevision, selectedProviderId, mode, currentRun?.id, currentRun?.status])} onPreview={() => onPreviewContext(text)} />
+        {commandMessage && <p className="command-feedback" role="status">{commandMessage}</p>}
         <div className="scope-bar">
           <div className="scope-choice">
             <span>分析范围</span>
@@ -406,22 +473,32 @@ export function AIWorkspace({
             <button className={scopeChoice === "filter" ? "active" : ""} onClick={() => onScopeChoice("filter")}>当前筛选</button>
             <button className={scopeChoice === "scenario" ? "active" : ""} onClick={() => onScopeChoice("scenario")}>当前场景</button>
           </div>
+          <p className="boundary-note">本次发送：{pendingScopeSummary}。发送时按当前条件固定快照，实际纳入数量以新 Run 为准；续查沿用所选 Run 的原范围。筛选/场景分析排除仍在进行中的请求并记录数量；手选请求需全部完成。</p>
           <div className="scope-facts">
+            <span>所选 Run 快照</span>
             <span><b>{scope?.requestCount ?? refs.length}</b> 样本</span>
             <span><b>{scope?.batchCount ?? "—"}</b> 批次总量</span>
             <span>{scope?.devices?.join("、") || "全部设备"}</span>
             <span>{scope?.snapshotAt ? new Date(scope.snapshotAt).toLocaleString("zh-CN") : "发送时固定快照"}</span>
+            {!!scope?.excludedUnfinishedCount && <span>快照排除 {scope.excludedUnfinishedCount} 条进行中请求（原匹配 {scope.matchedCountAtCreation} 条）</span>}
             {scope?.expired && <span className="scope-expired">范围已失效</span>}
           </div>
           <div className="budget-readout">
             <span>步骤 {usage?.requests ?? 0}/{budget?.maxSteps ?? 8}</span>
             <span>工具 {usage?.toolCalls ?? 0}/{budget?.maxToolCalls ?? 24}</span>
             <span>Token {usage?.totalTokens ?? "—"}{budget?.maxTotalTokens ? `/${budget.maxTotalTokens}` : ""}</span>
+            <span title="由供应商返回的用量；未报告时显示未知">缓存读 {usage?.cacheReadTokens ?? "未知"} / 写 {usage?.cacheWriteTokens ?? "未知"}</span>
             {usage?.cost && <span>成本 {usage.cost}</span>}
           </div>
         </div>
 
-        <div className="conversation-scroll" ref={scrollRef}>
+        <div className="conversation-scroll" ref={scrollRef} onScroll={() => {
+          const node = scrollRef.current;
+          if (!node) return;
+          followOutput.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+          if (followOutput.current) setNewContent(false);
+          try { sessionStorage.setItem(`ai-proxy-reading:${scrollSession.current}`, JSON.stringify({top: node.scrollTop, follow: followOutput.current})); } catch { /* Reading remains available without position persistence. */ }
+        }}>
           {session.messages.length === 0 && !live && (
             <div className="agent-welcome">
               <div className="welcome-orbit"><Bot size={30} /></div>
@@ -455,15 +532,16 @@ export function AIWorkspace({
             <div className="evidence-board">
               <div className="evidence-board-head">
                 <div><span className="eyebrow">EVIDENCE BOARD</span><h3>本轮引用</h3></div>
-                <span>{facts.length} 条有效证据</span>
+                <span>{facts.filter(item => item.state === "valid").length} 条有效 · {facts.filter(item => item.state !== "valid").length} 条失效</span>
               </div>
               <div className="evidence-grid">
                 {facts.map((item) => (
-                  <button className="evidence-card" key={item.id} onClick={() => onEvidence(item.requestId, item.direction, item.locator)}>
+                  <button className={`evidence-card ${item.state !== "valid" ? "stale" : ""}`} key={item.id}
+                    disabled={item.state === "deleted"} onClick={() => onEvidence(item.requestId, item.direction, item.locator)}>
                     <span className="evidence-direction">{item.direction}</span>
                     <b>{item.summary}</b>
                     <code>{item.locator}</code>
-                    <small>{item.requestId} · v{item.requestVersion} · {item.state === "valid" ? "有效" : `来源失效：${item.state}`}</small>
+                    <small>{item.requestId} · v{item.requestVersion} · {item.state === "valid" ? "有效" : item.state === "deleted" ? "原请求已删除，保留历史引用" : item.state === "stale-comparison" ? "对比样本已变化，请重新核对" : "原请求已更新，请重新核对"}</small>
                   </button>
                 ))}
               </div>
@@ -477,7 +555,8 @@ export function AIWorkspace({
                 <b>本轮为部分结果</b>
                 <span>{currentRun.statusDetail || "运行未完整结束，已获得的工具结果和证据仍然保留。"}</span>
               </div>
-              <button className="button ghost compact" onClick={() => void onContinue(currentRun)}><RefreshCw size={13} /> 继续分析</button>
+              <button className="button ghost compact" onClick={() => void onContinue(currentRun)}><RefreshCw size={13} /> 继续原快照</button>
+              <button className="button ghost compact" disabled={busy} title="按原筛选、选择或场景重新固定当前版本，创建新的模型分析任务；保留旧记录" onClick={() => void onFreshScope(currentRun)}>按原条件创建新快照分析</button>
             </div>
           )}
 
@@ -510,9 +589,28 @@ export function AIWorkspace({
             </div>
           ))}
 
-          {error && <div className="inline-error">{error}</div>}
+          {error && <div className="inline-error" role="alert">{error.message}
+            <p>草稿与引用已保留。{error.outcomeUnknown || error.code === "receipt_unknown" ? "回执未知，请先核对执行记录与实际结果，避免重复发送。" : error.code.startsWith("scope_") ? "请等待所选请求结束或调整范围；旧结果仍按原快照保留。" : error.code.startsWith("provider_") ? "请核对供应商、密钥、模型权限及账户用量。" : error.code === "timeout" ? "等待已超时，请先查看执行状态，再决定继续或重试。" : "请检查本次操作前置条件和执行记录。"}</p>
+            {currentRun && ["scope_expired", "scope_invalid"].includes(error.code) && <button className="button ghost compact" disabled={busy} onClick={() => void onFreshScope(currentRun)}>按原条件创建新快照分析</button>}
+            {error.code.startsWith("scope_") && <button className="button ghost compact" onClick={onAdjustScope}>重新选择请求 / 调整场景</button>}
+            {(error.code.startsWith("scope_") || error.code === "original_task_missing") && <button className="button ghost compact" onClick={() => {
+              const target = session.id;
+              if (!currentRun) { setCommandMessage("请直接在输入框指定原问题；未调用模型。"); inputRef.current?.focus(); return; }
+              void call<{sessionId: string; text: string}>("agent.original-task", {runId: currentRun.id}).then(original => {
+                if (visibleSession.current !== target || original.sessionId !== target) return;
+                setText(original.text); setCommandMessage("已复制原任务问题；请核对范围后发送。"); inputRef.current?.focus();
+              }).catch(reason => { if (visibleSession.current === target) setCommandMessage(String(reason)); });
+            }}>复制保存的问题到输入框</button>}
+            {error.code.startsWith("provider_") && <button className="button ghost compact" onClick={onSettings}>检查供应商配置</button>}
+            <button className="button ghost compact" onClick={() => onOpenWorkbench("runs")}>查看执行记录</button><DiagnosticCopy area="agent" runId={currentRun?.id} status={currentRun?.status} />
+          </div>}
         </div>
 
+        {newContent && <button className="new-output" onClick={() => {
+          followOutput.current = true;
+          setNewContent(false);
+          if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        }}>有新内容 · 回到底部</button>}
         <div className="composer-wrap">
           {refs.length > 0 && (
             <div className="composer-refs">
@@ -530,18 +628,31 @@ export function AIWorkspace({
               <button className={mode === "debug" ? "active" : ""} onClick={() => onMode("debug")}><Wrench size={12} /> 允许调试操作</button>
             </div>
             <button className="budget-link" onClick={() => onOpenWorkbench("runs")}><ClipboardCheck size={12} /> 预算与执行记录</button>
-            <button className={`budget-link ${reports.length ? "active" : ""}`} onClick={() => reports[0] && setReportId(reports[0].id)}><FileText size={12} /> 报告 {reports.length || ""}</button>
+            <button className={`budget-link ${reportTotal ? "active" : ""}`} onClick={() => reports[0] && setReportId(reports[0].id)}><FileText size={12} /> 报告 {reportTotal || ""}</button>
           </div>
+          <p className="boundary-note">发送至 {provider ? `${provider.name} · ${provider.model} · ${provider.baseUrl}` : "尚未选择的供应商"}；按上方本次发送条件创建固定范围，可能产生模型费用。</p>
           <div className={`composer ${!provider ? "needs-provider" : ""}`}>
+            {suggestions.length > 0 && <div id="agent-command-list" className="agent-command-list" role="listbox" aria-label="本地命令">
+              {suggestions.map((item, index) => <button type="button" id={`agent-command-${index}`} role="option" aria-selected={index === Math.min(commandIndex, suggestions.length-1)} key={item.name} disabled={busy && item.idle}
+                onMouseDown={event => event.preventDefault()} onClick={() => chooseCommand(item.name)}><b>{item.name}</b><span>{item.label} · {busy && item.idle ? "请先停止或等待" : item.description}</span></button>)}
+            </div>}
             <textarea
+              ref={inputRef} role="combobox" aria-autocomplete="list" aria-expanded={suggestions.length > 0} aria-controls="agent-command-list"
+              aria-activedescendant={suggestions.length ? `agent-command-${Math.min(commandIndex, suggestions.length-1)}` : undefined}
               value={text}
-              placeholder={provider ? "描述你要排查、对比或验证的目标…" : "先配置一个供应商，再开始对话"}
-              onChange={(event) => setText(event.target.value)}
+              placeholder={provider ? "描述你要排查、对比或验证的目标…" : "可输入 / 使用本地命令；模型分析需配置供应商"}
+              onChange={(event) => { setText(event.target.value); setCommandDismissed(false); setCommandIndex(0); }}
+              onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; }}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
+                if (composing.current || event.nativeEvent.isComposing || event.keyCode === 229) return;
+                if (suggestions.length && ["ArrowDown", "ArrowUp", "Tab", "Escape", "Enter"].includes(event.key) && !event.shiftKey) {
                   event.preventDefault();
-                  void submit();
+                  if (event.key === "Escape") setCommandDismissed(true);
+                  else if (event.key === "ArrowDown" || event.key === "ArrowUp") setCommandIndex(value => (value+(event.key === "ArrowDown" ? 1 : suggestions.length-1)) % suggestions.length);
+                  else { const item = suggestions[Math.min(commandIndex, suggestions.length-1)]; if (!busy || !item.idle) chooseCommand(item.name); }
+                  return;
                 }
+                if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); }
               }}
               onFocus={() => setProviderOpen(false)}
             />
@@ -549,7 +660,7 @@ export function AIWorkspace({
               <div className="composer-tools">
                 <button title="共享本地文件（用于 Map Local）" onClick={() => void onPickFile()}><FilePlus2 size={16} /></button>
                 <button title="生成人工测试点" disabled={!refs.length || busy} onClick={() => void onStartChecklist(refs.map((item) => item.id))}><ClipboardCheck size={16} /></button>
-                <label className="auto-apply" title="仅调试模式可用；每个变更仍绑定预览版本">
+                <label className="auto-apply" title="仅调试模式可用；规则/弱网绑定预览版本；新增Shell、代理、手机许可和批量发送始终人工批准">
                   <input type="checkbox" disabled={mode !== "debug"} checked={autoApply} onChange={(event) => onAutoApply(event.target.checked)} />
                   <span>{mode === "debug" ? "本会话自动执行已预览变更" : "只读模式"}</span>
                 </label>
@@ -573,17 +684,19 @@ export function AIWorkspace({
                   )}
                 </div>
                 {busy ? (
-                  <button className="send-button stop" title="停止" onClick={() => void onStop()}><Square size={14} fill="currentColor" /></button>
+                  <button className="send-button stop" title="停止" aria-label="停止分析" disabled={stopping} onClick={async () => { setStopping(true); try { await onStop(); } finally { setStopping(false); } }}><Square size={14} fill="currentColor" /></button>
                 ) : (
-                  <button className="send-button" title="发送" disabled={!text.trim() || !provider} onClick={() => void submit()}><ArrowUp size={17} /></button>
+                  <button className="send-button" title="发送" aria-label="发送分析请求" disabled={sending || !text.trim() || !provider && !text.trim().startsWith("/")} onClick={() => void submit()}>{sending ? <LoaderCircle size={17} className="spin" /> : <ArrowUp size={17} />}</button>
                 )}
               </div>
             </div>
           </div>
-          <div className="composer-note">Enter 发送 · 固定范围与分析版本 · 工具结果和证据会持久化 · 写操作仅在调试模式注册</div>
+          <div className="composer-note">输入 / 查看本地命令 · // 发送普通斜杠文本 · Enter 发送 · 写操作仅在调试模式注册</div>
         </div>
       </main>
 
+      {reportError && <p role="alert">{reportError}<button onClick={() => setReportId(null)}>关闭报告</button></p>}
+      {reportId && !report && !reportError && <p role="status">正在读取报告正文…<button onClick={() => setReportId(null)}>取消查看</button></p>}
       {report && draftReport && (
         <div className="report-drawer">
           <div className="report-drawer-head">
@@ -592,7 +705,7 @@ export function AIWorkspace({
               <button title="复制 Markdown" onClick={() => void navigator.clipboard.writeText(draftReport.content)}><Copy size={14} /></button>
               <button title="导出 Markdown" onClick={() => void onExportReport(draftReport, "markdown")}><Download size={14} /></button>
               <button title="导出 JSON" onClick={() => void onExportReport(draftReport, "json")}><PanelRight size={14} /></button>
-              <button title="删除" onClick={() => void onDeleteReport(draftReport)}><Trash2 size={14} /></button>
+              <button title="删除" onClick={() => void onDeleteReport(draftReport).then(() => setReportId(null)).catch(reason => setReportError(String(reason)))}><Trash2 size={14} /></button>
               <button title="关闭" onClick={() => setReportId(null)}><X size={15} /></button>
             </div>
           </div>

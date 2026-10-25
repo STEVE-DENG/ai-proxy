@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -17,7 +17,7 @@ from .jobs import CANCEL_EVENT
 
 
 MAX_BODY_BYTES = 5 * 1024 * 1024
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def now_ms() -> int:
@@ -53,16 +53,21 @@ class Store:
         self._initialize_with_recovery()
         self._ensure_redaction_salt()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.db_path, timeout=15)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=15000")
-        event = CANCEL_EVENT.get()
-        if event is not None:
-            connection.set_progress_handler(lambda: 1 if event.is_set() else 0, 1000)
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=15000")
+            event = CANCEL_EVENT.get()
+            if event is not None:
+                connection.set_progress_handler(lambda: 1 if event.is_set() else 0, 1000)
+            with connection:
+                yield connection
+        finally:
+            # sqlite3.Connection.__exit__ commits/rolls back, but does not close.
+            connection.close()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -88,19 +93,20 @@ class Store:
                     raise ValueError(f"数据库版本 {version} 高于支持版本 {SCHEMA_VERSION}，拒绝降级")
                 if version < SCHEMA_VERSION:
                     backup_path = self.data_dir / f"migration-{version}-{now_ms()}.sqlite3"
-                    with sqlite3.connect(backup_path) as backup:
+                    with closing(sqlite3.connect(backup_path)) as backup:
                         source.backup(backup)
         try:
             self._init_schema()
         except Exception as error:
             if backup_path:
-                with sqlite3.connect(backup_path) as backup, self.connect() as target:
+                with closing(sqlite3.connect(backup_path)) as backup, self.connect() as target:
                     backup.backup(target)
                 raise RuntimeError(f"迁移失败，已恢复；备份: {backup_path}: {error}") from error
             raise
 
     def _init_schema(self) -> None:
         with self.connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -423,6 +429,33 @@ class Store:
                 );
                 """
             )
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS preview_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+                INSERT OR IGNORE INTO preview_revision VALUES(1,0);
+                CREATE TABLE IF NOT EXISTS compose_jobs (
+                    id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, status TEXT NOT NULL,
+                    summary_json TEXT NOT NULL, job_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_compose_jobs_created ON compose_jobs(created_at DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS idx_compose_jobs_status ON compose_jobs(status);
+            """)
+            # Conservative invalidation includes equal-size replacements and deletions.
+            for table in ("requests", "scenarios", "scenario_requests", "providers", "rules", "configs", "run_messages", "messages"):
+                for event in ("INSERT", "UPDATE", "DELETE"):
+                    db.execute(f"CREATE TRIGGER IF NOT EXISTS preview_{table}_{event.lower()} AFTER {event} ON {table} BEGIN UPDATE preview_revision SET revision=revision+1 WHERE id=1; END")
+            for event in ("INSERT", "UPDATE", "DELETE"):
+                target = "OLD" if event == "DELETE" else "NEW"
+                db.execute(f"""CREATE TRIGGER IF NOT EXISTS preview_settings_{event.lower()} AFTER {event} ON settings
+                    WHEN {target}.key IN ('agent_context_settings','throttle','active_environment','config_version')
+                      OR {target}.key LIKE 'agent-context:%' OR {target}.key LIKE 'model-window:%'
+                    BEGIN UPDATE preview_revision SET revision=revision+1 WHERE id=1; END""")
+            if db.execute("PRAGMA user_version").fetchone()[0] < 6:
+                # One-time migration only; future lists never scan historical settings.
+                for row in db.execute("SELECT value FROM settings WHERE key LIKE 'replay-job:%'").fetchall():
+                    job = _load_json(row[0], {})
+                    if job.get("id"):
+                        summary = {key: value for key, value in job.items() if key != "actionIds"}
+                        db.execute("INSERT OR IGNORE INTO compose_jobs VALUES(?,?,?,?,?)", (job["id"], job["createdAt"], job["status"], _json(summary), _json(job)))
             previous_version = db.execute("PRAGMA user_version").fetchone()[0]
             for version in range(previous_version + 1, SCHEMA_VERSION + 1):
                 self._migrate_columns(db, version)
@@ -434,6 +467,7 @@ class Store:
             db.execute('CREATE INDEX IF NOT EXISTS idx_requests_source\n                    ON requests(batch_id, source_ip, started_at);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_requests_trace\n                    ON requests(batch_id, trace_id);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_requests_host\n                    ON requests(batch_id, host, path);')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_requests_host_time ON requests(batch_id, scheme, host, port, started_at, id);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_runs_session ON analysis_runs(session_id, created_at);')
@@ -450,6 +484,7 @@ class Store:
             db.execute('CREATE INDEX IF NOT EXISTS idx_debug_actions ON debug_actions(created_at);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_spans_trace ON external_spans(trace_id, start_ns);')
             db.execute('CREATE INDEX IF NOT EXISTS idx_replay_actions ON replay_actions(created_at);')
+            db.execute("CREATE INDEX IF NOT EXISTS idx_messages_run_role ON messages(run_id,role,created_at)")
 
             count = db.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
             if count == 0:
@@ -626,6 +661,17 @@ class Store:
         path.write_bytes(payload)
         path.chmod(0o600)
         return str(path), len(data), truncated
+
+    def recover_interrupted_requests(self) -> int:
+        stamp = now_ms()
+        with self.connect() as db:
+            cursor = db.execute(
+                "UPDATE requests SET request_state = 'error', error = ?, finished_at = ?, "
+                "duration_ms = MAX(0, ? - started_at), response_body_state = 'missing', "
+                "version = version + 1 WHERE request_state = 'in_progress'",
+                ("上次采集已中断，未收到完整响应", stamp, stamp),
+            )
+            return cursor.rowcount
 
     def save_request(self, data: dict[str, Any]) -> dict[str, Any]:
         data = dict(data)
@@ -861,8 +907,10 @@ class Store:
         sort: str = "desc",
         since_started_at: int | None = None,
         exclude_ids: list[str] | None = None,
+        include_ids: list[str] | None = None,
         scope_run_id: str | None = None,
         tree_summary: bool = False,
+        host_summary: bool = False,
         seek_id: str | None = None,
         offset: int = 0,
         scheme: str = "",
@@ -930,6 +978,11 @@ class Store:
         if exclude_ids:
             clauses.append(f"id NOT IN ({','.join('?' for _ in exclude_ids)})")
             values.extend(exclude_ids)
+        if include_ids is not None:
+            if not isinstance(include_ids, list) or len(include_ids) > 1000 or any(not isinstance(item, str) for item in include_ids):
+                raise ValueError("includeIds必须是最多1000个请求ID的数组")
+            clauses.append(f"id IN ({','.join('?' for _ in include_ids)})" if include_ids else "0")
+            values.extend(include_ids)
         if scope_run_id:
             clauses.append(
                 "id IN (SELECT request_id FROM analysis_scope_requests WHERE run_id = ?)"
@@ -964,6 +1017,16 @@ class Store:
                     f"SELECT COUNT(*) FROM requests WHERE {where} AND started_at > ?",
                     (*values, since_started_at),
                 ).fetchone()[0]
+            if host_summary:
+                rows = db.execute(
+                    f"SELECT scheme, host, port, COUNT(*) AS count, "
+                    "SUM(CASE WHEN status >= 400 OR error IS NOT NULL OR tls_error IS NOT NULL OR rule_error IS NOT NULL OR business_state = 'business-failure' THEN 1 ELSE 0 END) AS failures, "
+                    "SUM(CASE WHEN request_state = 'in_progress' THEN 1 ELSE 0 END) AS pending, "
+                    f"MAX(started_at) AS latest FROM requests WHERE {where} "
+                    "GROUP BY scheme, host, port ORDER BY scheme, host, port",
+                    tuple(values),
+                ).fetchall()
+                return {"items": [dict(row) for row in rows], "matchCount": total, "batchCount": batch_total}
             if tree_summary:
                 partition = "scheme, host, port, method, substr(path, 1, instr(path || '?', '?') - 1)"
                 rows = db.execute(
@@ -981,6 +1044,7 @@ class Store:
                     operator = ">" if descending else "<"
                     rank = db.execute(f"SELECT COUNT(*) FROM requests WHERE {where} AND (started_at {operator} ? OR (started_at = ? AND id {operator} ?))", (*values, target["started_at"], target["started_at"], target["id"])).fetchone()[0]
                     offset = (rank // safe_limit) * safe_limit
+            offset = min(max(0, int(offset)), max(0, (total - 1) // safe_limit * safe_limit))
             rows = db.execute(
                 f"SELECT * FROM requests WHERE {' AND '.join(page_clauses)} "
                 f"ORDER BY started_at {order}, id {order} LIMIT ? OFFSET ?",
@@ -1269,6 +1333,9 @@ class Store:
 
     def delete_session(self, session_id: str) -> None:
         with self.connect() as db:
+            db.execute("DELETE FROM settings WHERE key = ?", (f"agent-context:{session_id}",))
+            prefix = f"agent-submission:{session_id}:"
+            db.execute("DELETE FROM settings WHERE substr(key,1,?)=?", (len(prefix), prefix))
             db.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
             db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             db.execute(
@@ -1376,7 +1443,9 @@ class Store:
 
     def get_run(self, run_id: str) -> dict[str, Any]:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM analysis_runs WHERE id = ?", (run_id,)).fetchone()
+            row = db.execute("""SELECT analysis_runs.*,
+                (SELECT content FROM messages WHERE run_id=analysis_runs.id AND role='user' ORDER BY created_at,id LIMIT 1) AS task_text
+                FROM analysis_runs WHERE id = ?""", (run_id,)).fetchone()
             if row is None:
                 raise ValueError("分析记录不存在")
             events = db.execute(
@@ -1387,8 +1456,9 @@ class Store:
                 "SELECT * FROM evidence WHERE run_id = ? ORDER BY created_at",
                 (run_id,),
             ).fetchall()
+            value = self._history_title(db, row)
         return {
-            **self._run_to_dict(row),
+            **value,
             "events": [self._event_to_dict(item) for item in events],
             "evidence": [self._evidence_to_dict(item) for item in evidence],
         }
@@ -1397,13 +1467,46 @@ class Store:
         with self.connect() as db:
             return self._list_run_rows(db, session_id, limit)
 
+    def run_history(self, session_id: str, offset: int = 0, limit: int = 12) -> dict[str, Any]:
+        self.get_session(session_id)
+        limit = max(1, min(limit, 50))
+        with self.connect() as db:
+            total = db.execute("SELECT count(*) FROM analysis_runs WHERE session_id=?", (session_id,)).fetchone()[0]
+            offset = min(max(0, offset), max(0, ((total-1)//limit)*limit))
+            rows = db.execute("""SELECT analysis_runs.*,
+                (SELECT substr(content,1,160) FROM messages WHERE run_id=analysis_runs.id AND role='user' ORDER BY created_at,id LIMIT 1) AS task_text
+                FROM analysis_runs WHERE session_id=? ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?""", (session_id, limit, offset)).fetchall()
+            items = [self._history_title(db, row) for row in rows]
+        return {"items": items, "total": total, "offset": offset}
+
     @staticmethod
     def _list_run_rows(db: sqlite3.Connection, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         rows = db.execute(
-            "SELECT * FROM analysis_runs WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+            """SELECT analysis_runs.*,
+                (SELECT substr(content,1,160) FROM messages WHERE run_id=analysis_runs.id AND role='user' ORDER BY created_at,id LIMIT 1) AS task_text
+                FROM analysis_runs WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
             (session_id, max(1, min(limit, 200))),
         ).fetchall()
-        return [Store._run_to_dict(row) for row in rows]
+        return [Store._history_title(db, row) for row in rows]
+
+    @staticmethod
+    def _history_title(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        value = Store._run_to_dict(row)
+        if not value.get("parentRunId"):
+            return value
+        chain = db.execute("""WITH RECURSIVE parents(id,parent_run_id,session_id,depth,path) AS (
+            SELECT id,parent_run_id,session_id,0,'|'||id||'|' FROM analysis_runs WHERE id=?
+            UNION ALL SELECT r.id,r.parent_run_id,r.session_id,p.depth+1,p.path||r.id||'|'
+            FROM analysis_runs r JOIN parents p ON r.id=p.parent_run_id
+            WHERE p.depth<64 AND r.session_id=p.session_id AND instr(p.path,'|'||r.id||'|')=0
+        ) SELECT id,parent_run_id,depth FROM parents ORDER BY depth DESC LIMIT 1""", (row["id"],)).fetchone()
+        if chain and not chain["parent_run_id"]:
+            text = db.execute("SELECT substr(content,1,160) FROM messages WHERE run_id=? AND role='user' ORDER BY created_at,id LIMIT 1", (chain["id"],)).fetchone()
+            if text and text[0]:
+                value.update(taskText=text[0], continuationDepth=chain["depth"], rootTaskMissing=False)
+                return value
+        value.update(rootTaskMissing=True, continuationDepth=chain["depth"] if chain else 0)
+        return value
 
     @staticmethod
     def _run_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -1418,6 +1521,7 @@ class Store:
             "model": row["model"],
             "status": row["status"],
             "statusDetail": row["status_detail"],
+            "taskText": row["task_text"] if "task_text" in row.keys() else None,
             "budget": _load_json(row["budget_json"], {}),
             "usage": _load_json(row["usage_json"], {}),
             "summary": row["summary"],
@@ -1761,6 +1865,20 @@ class Store:
             else:
                 rows = db.execute("SELECT * FROM reports ORDER BY updated_at DESC").fetchall()
         return [self._report_to_dict(row) for row in rows]
+
+    def report_summaries(self) -> list[dict[str, Any]]:
+        # Compatibility catalogue/selectors need titles, never full report bodies.
+        with self.connect() as db:
+            rows = db.execute("SELECT id,session_id,title FROM reports ORDER BY updated_at DESC,id DESC").fetchall()
+        return [{"id": row["id"], "sessionId": row["session_id"], "title": row["title"]} for row in rows]
+
+    def report_history(self, session_id: str, offset: int = 0, limit: int = 8) -> dict[str, Any]:
+        limit = max(1, min(limit, 50))
+        with self.connect() as db:
+            total = db.execute("SELECT count(*) FROM reports WHERE session_id=?", (session_id,)).fetchone()[0]
+            offset = min(max(0, offset), max(0, ((total-1)//limit)*limit))
+            rows = db.execute("SELECT id,session_id,run_id,title,status,created_at,updated_at FROM reports WHERE session_id=? ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?", (session_id,limit,offset)).fetchall()
+        return {"items": [{"id": row["id"], "sessionId": row["session_id"], "runId": row["run_id"], "title": row["title"], "status": row["status"], "createdAt": row["created_at"], "updatedAt": row["updated_at"]} for row in rows], "total": total, "offset": offset}
 
     def delete_report(self, report_id: str) -> None:
         with self.connect() as db:
@@ -2313,6 +2431,7 @@ class Store:
                 "imports",
                 "external_spans",
                 "replay_actions",
+                "compose_jobs",
                 "tickets",
                 "debug_actions",
                 "batches",
@@ -2321,12 +2440,15 @@ class Store:
             ):
                 db.execute(f"DELETE FROM {table}")
             db.execute("DELETE FROM settings WHERE key LIKE 'file-grant:%'")
+            db.execute("DELETE FROM settings WHERE key LIKE 'agent-submission:%'")
+            db.execute("DELETE FROM settings WHERE key LIKE 'agent-context:%'")
+            db.execute("DELETE FROM settings WHERE key LIKE 'replay-job:%'")
             db.execute("DELETE FROM configs WHERE kind LIKE 'qa_%' OR kind = 'evidence_package'")
             if scope == "project":
                 db.execute("DELETE FROM configs")
                 db.execute("DELETE FROM mcp_servers")
                 db.execute("DELETE FROM rules")
-                db.execute("DELETE FROM settings WHERE key NOT IN ('redaction_salt', 'listen_port')")
+                db.execute("DELETE FROM settings WHERE key NOT IN ('redaction_salt', 'listen_port') AND key NOT LIKE 'provider-cache:%'")
         for path in (self.data_dir / "generated-mocks").glob("*"):
             if path.is_file():
                 path.unlink()
@@ -2345,6 +2467,7 @@ class Store:
                 "protocol": row["protocol"],
                 "baseUrl": row["base_url"],
                 "model": row["model"],
+                "cachePolicy": self.get_setting(f"provider-cache:{row['id']}", "auto"),
                 "createdAt": row["created_at"],
                 "updatedAt": row["updated_at"],
             }
@@ -2353,6 +2476,17 @@ class Store:
 
     def save_provider(self, data: dict[str, Any]) -> dict[str, Any]:
         provider_id = data.get("id") or new_id("provider")
+        policy = data.get("cachePolicy", "auto")
+        if policy not in {"auto", "enabled", "off"}:
+            raise ValueError("缓存策略必须为 auto/enabled/off")
+        if data.get("protocol") not in {"openai-responses", "openai-chat", "anthropic"}:
+            raise ValueError("不支持的供应商协议")
+        from urllib.parse import urlsplit
+        parsed = urlsplit(str(data.get("baseUrl", "")))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Base URL 需要有效的 http(s) 地址，不能包含用户名或密钥")
+        if not str(data.get("name", "")).strip() or not str(data.get("model", "")).strip():
+            raise ValueError("请填写供应商名称和模型ID")
         timestamp = now_ms()
         with self.connect() as db:
             existing = db.execute("SELECT id FROM providers WHERE id = ?", (provider_id,)).fetchone()
@@ -2366,11 +2500,13 @@ class Store:
                     "INSERT INTO providers(id, name, protocol, base_url, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (provider_id, data["name"], data["protocol"], data["baseUrl"], data["model"], timestamp, timestamp),
                 )
+            db.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"provider-cache:{provider_id}", policy))
         return next(item for item in self.list_providers() if item["id"] == provider_id)
 
     def delete_provider(self, provider_id: str) -> None:
         with self.connect() as db:
             db.execute("DELETE FROM providers WHERE id = ?", (provider_id,))
+            db.execute("DELETE FROM settings WHERE key = ?", (f"provider-cache:{provider_id}",))
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         with self.connect() as db:

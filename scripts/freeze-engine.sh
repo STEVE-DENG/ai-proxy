@@ -23,3 +23,6 @@ DESTINATION="$ROOT/src-tauri/binaries/ai-proxy-engine-$TARGET"
 cp "dist/ai-proxy-engine" "$DESTINATION.new"
 chmod +x "$DESTINATION.new"
 mv -f "$DESTINATION.new" "$DESTINATION"
+
+cd "$ROOT"
+node scripts/engine-metadata.mjs

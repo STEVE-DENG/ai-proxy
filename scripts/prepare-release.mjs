@@ -1,0 +1,70 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { verifyBuild } from './build-metadata.mjs';
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+process.chdir(root);
+const flags = new Set(process.argv.slice(2));
+for (const arg of flags) if (!['--skip-build', '--require-notarized'].includes(arg)) throw new Error(`Unknown argument: ${arg}`);
+if (process.platform !== 'darwin') throw new Error('Release packaging requires macOS.');
+function run(command, args, capture = false) {
+  const result = spawnSync(command, args, {cwd: root, encoding: 'utf8', stdio: capture ? 'pipe' : 'inherit'});
+  if (result.error || result.status !== 0) throw new Error(`${command} failed: ${result.error?.message || result.stderr || result.status}`);
+  return result.stdout?.trim() || '';
+}
+const pkg = JSON.parse(fs.readFileSync('package.json'));
+const version = pkg.version;
+const jsonVersions = ['package-lock.json', 'src-tauri/tauri.conf.json'].map(name => JSON.parse(fs.readFileSync(name)).version);
+const tomlVersions = ['src-tauri/Cargo.toml', 'engine/pyproject.toml'].map(name => fs.readFileSync(name,'utf8').match(/^version = "([^"]+)"/m)?.[1]);
+if ([...jsonVersions,...tomlVersions].some(value => value !== version)) throw new Error('Version manifests disagree; use npm run version:set -- X.Y.Z.');
+if (!flags.has('--skip-build')) { run('npm', ['run','engine:freeze']); run('npm', ['run','app:build']); }
+const app = path.join(root, 'src-tauri/target/release/bundle/macos/AI Proxy.app');
+run('/usr/bin/codesign', ['--verify','--deep','--strict', app]);
+const provenance = verifyBuild(app);
+const bundledVersion = run('/usr/libexec/PlistBuddy', ['-c','Print :CFBundleShortVersionString',path.join(app,'Contents/Info.plist')], true);
+if (bundledVersion !== version) throw new Error('App version differs from source; rebuild first.');
+const main = path.join(app,'Contents/MacOS/ai-proxy'), sidecar = path.join(app,'Contents/MacOS/ai-proxy-engine');
+const arch = run('/usr/bin/lipo', ['-archs',main], true);
+if (!['arm64','x86_64'].includes(arch) || run('/usr/bin/lipo',['-archs',sidecar],true) !== arch) throw new Error('Main/sidecar architectures disagree or are unsupported.');
+const platform = arch === 'arm64' ? 'macos-arm64' : 'macos-x64';
+const signature = spawnSync('/usr/bin/codesign',['-dv','--verbose=4',app],{encoding:'utf8'}).stderr || '';
+const notarized = spawnSync('xcrun',['stapler','validate',app],{encoding:'utf8'}).status === 0;
+if (flags.has('--require-notarized') && (!notarized || signature.includes('Signature=adhoc'))) throw new Error('A Developer ID signed and stapled notarized application is required.');
+const out = path.join(root,'release',version,platform);
+if (fs.existsSync(out)) throw new Error(`Refusing to overwrite existing release: ${out}`);
+const stage = fs.mkdtempSync(path.join(os.tmpdir(),'ai-proxy-release-'));
+fs.mkdirSync(out,{recursive:true});
+const sha = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const dirty = !!run('git',['status','--porcelain'],true);
+const metadata = {version, platform, createdAt:new Date().toISOString(), commit:run('git',['rev-parse','HEAD'],true), dirtyWorkingTree:dirty, sourceSha256:provenance.sourceSha256, notarized, signing:signature.includes('Signature=adhoc')?'ad-hoc':'identity-signed', manualAcceptance:'pending', binaries:{'ai-proxy':sha(main),'ai-proxy-engine':sha(sidecar)}};
+try {
+  const copied = path.join(stage,'AI Proxy.app');
+  run('/usr/bin/ditto',[app,copied]);
+  fs.symlinkSync('/Applications',path.join(stage,'Applications'));
+  for (const name of ['LICENSE','THIRD_PARTY_NOTICES.md']) fs.copyFileSync(name,path.join(stage,name));
+  const notices = path.join(out,'notices');
+  run(path.join(root,'engine/.venv/bin/python'), ['scripts/collect-licenses.py',notices]);
+  const review = JSON.parse(fs.readFileSync(path.join(notices,'license-review.json')));
+  metadata.licenseTextReviewCount = review.length;
+  if (flags.has('--require-notarized') && review.length) throw new Error('License texts require review before public distribution.');
+  fs.cpSync(notices,path.join(stage,'notices'),{recursive:true});
+  const install = `# AI Proxy ${version}\n\nPlatform: ${platform}. ${metadata.signing}; notarized: ${notarized}.\n\nOpen the disk image and drag AI Proxy.app onto Applications. Then open it from Applications. Python, Node and Rust are bundled or unnecessary at runtime.\n\n${notarized ? 'The package includes a notarization ticket; verify it on a clean target Mac.' : 'Development preview: Gatekeeper may require approval in System Settings > Privacy & Security. It is not a zero-friction public installer. Do not disable Gatekeeper.'}\n\nCapturing and offline HAR import do not require a Provider. Choose phone, local capture or offline import in Help. New projects start without HTTPS decryption. HTTPS capture needs device CA installation/trust; AI needs your own Provider account.\n\nUpgrade after quitting the app. Preserve the app data directory, not only SQLite. This build has pending manual acceptance. License texts needing review: ${review.length}; see notices/license-review.json.\n`;
+  fs.writeFileSync(path.join(stage,'INSTALL.md'),install); fs.writeFileSync(path.join(out,'INSTALL.md'),install);
+  fs.writeFileSync(path.join(stage,'build.json'),JSON.stringify(metadata,null,2)+'\n');
+  const prefix = `AI-Proxy-${version}-${platform}${notarized?'':'-preview'}`;
+  const zip = path.join(out,prefix+'.zip'), dmg=path.join(out,prefix+'.dmg');
+  run('/usr/bin/ditto',['-c','-k',stage,zip]);
+  run('/usr/bin/hdiutil',['create','-volname',`AI Proxy ${version}`,'-srcfolder',stage,'-format','UDZO',dmg]);
+  run('/usr/bin/hdiutil',['verify',dmg]);
+  metadata.assets = [zip,dmg].map(file=>({name:path.basename(file),bytes:fs.statSync(file).size,sha256:sha(file)}));
+  fs.writeFileSync(path.join(out,'build.json'),JSON.stringify(metadata,null,2)+'\n');
+  fs.writeFileSync(path.join(out,'SHA256SUMS'),metadata.assets.map(file=>`${file.sha256}  ${file.name}`).join('\n')+'\n');
+  fs.copyFileSync(path.join(out,'SHA256SUMS'),path.join(out,`AI-Proxy-${version}-${platform}-SHA256SUMS.txt`));
+  fs.copyFileSync(path.join(out,'build.json'),path.join(out,`AI-Proxy-${version}-${platform}-build.json`));
+  fs.copyFileSync(`docs/release-notes-${version}.md`,path.join(out,'RELEASE-NOTES.md'));
+  console.log(`Prepared ${out}; no tag, upload, release or app launch performed.`);
+} catch (error) { fs.writeFileSync(path.join(out,'INCOMPLETE.txt'),String(error)+'\n'); throw error; }
+finally { fs.rmSync(stage,{recursive:true,force:true}); }

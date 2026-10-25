@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-const KEYCHAIN_SERVICE: &str = "com.nekoya.ai-proxy";
+mod credentials;
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
 
 #[cfg(unix)]
@@ -66,6 +66,7 @@ struct LocalProxyStatus {
 struct AppState {
     engine: Engine,
     proxy_snapshot: Mutex<Option<ProxySnapshot>>,
+    credentials_lock: Mutex<()>,
 }
 
 impl Engine {
@@ -127,11 +128,10 @@ impl Engine {
                         let result = if value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                             Ok(value.get("result").cloned().unwrap_or(Value::Null))
                         } else {
-                            Err(value
-                                .get("error")
-                                .and_then(Value::as_str)
-                                .unwrap_or("引擎请求失败")
-                                .to_string())
+                            Err(json!({
+                                "message": value.get("error").and_then(Value::as_str).unwrap_or("引擎请求失败"),
+                                "code": value.get("errorCode").and_then(Value::as_str).unwrap_or("internal")
+                            }).to_string())
                         };
                         if let Some(reply) = pending.lock().unwrap().remove(&id) {
                             let _ = reply.sender.send(result);
@@ -142,6 +142,13 @@ impl Engine {
                         let _ = app_stdout.emit("engine-ready", &value);
                     }
                     _ => {}
+                }
+            }
+            if let Ok(mut replies) = pending.lock() {
+                for (_, reply) in replies.drain() {
+                    let _ = reply
+                        .sender
+                        .send(Err("本地引擎已退出，请重新打开应用".to_string()));
                 }
             }
             let _ = app_stdout.emit("engine-exit", json!({"message": "本地引擎已退出"}));
@@ -174,13 +181,48 @@ impl Engine {
             .map_err(|e| e.to_string())?
             .insert(id, PendingReply { sender: tx });
         let payload = json!({"id": id, "method": method, "params": params});
-        {
+        let write_result = (|| -> Result<(), String> {
             let mut stdin = state.engine.stdin.lock().map_err(|e| e.to_string())?;
             let writer = stdin.as_mut().ok_or("本地引擎未运行")?;
             writeln!(writer, "{}", payload).map_err(|e| format!("写入引擎失败: {e}"))?;
             writer.flush().map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            state.engine.pending.lock().unwrap().remove(&id);
+            return Err(error);
         }
-        match rx.recv_timeout(Duration::from_secs(90)) {
+        let timeout = if (method.starts_with("requests.") && method != "requests.add-relation")
+            || matches!(
+                method,
+                "storage.health"
+                    | "agent.original-task"
+                    | "agent.context.identity"
+                    | "reports.history"
+                    | "compose.status"
+                    | "compose.list"
+                    | "agent.history"
+                    | "agent.rebuild-preview"
+                    | "agent.context.preview"
+                    | "agent.context"
+                    | "agent.performance-compare"
+                    | "agent.evidence"
+                    | "agent.runs"
+                    | "agent.run"
+                    | "agent.events"
+                    | "agent.status"
+                    | "sessions.get"
+                    | "sessions.list"
+                    | "reports.get"
+                    | "reports.list"
+            ) {
+            23
+        } else if method.starts_with("qa.") {
+            120
+        } else {
+            90
+        };
+        match rx.recv_timeout(Duration::from_secs(timeout)) {
             Ok(result) => result,
             Err(_) => {
                 state.engine.pending.lock().unwrap().remove(&id);
@@ -278,7 +320,84 @@ async fn engine_call(
     let _ = state;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app2.state::<AppState>();
-        Engine::call(&app2, &state, &method2, params.unwrap_or(json!({})))
+        let mut params = params.unwrap_or(json!({}));
+        if method2 == "providers.save" {
+            let _lock = state.credentials_lock.lock().map_err(|e| e.to_string())?;
+            let id = params
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("供应商ID缺失")?
+                .to_string();
+            let old = credentials::load(&app2)?;
+            let mut updated = old.clone();
+            let reuse = params.as_object_mut().and_then(|p| p.remove("reuseFrom"));
+            if let Some(Value::String(source)) = reuse {
+                let key = old
+                    .get(&source)
+                    .ok_or("原账户尚未保存本地密钥，请在来源项目重新录入一次")?;
+                updated.insert(id.clone(), key.clone());
+            }
+            let key = params.as_object_mut().and_then(|p| p.remove("apiKey"));
+            if let Some(Value::String(key)) = key {
+                updated.insert(id.clone(), key);
+            }
+            if !updated.contains_key(&id) {
+                return Err("请录入 API Key；本机无密钥服务可留空保存".into());
+            }
+            credentials::save(&app2, &updated)?;
+            let result = Engine::call(&app2, &state, &method2, params);
+            if result.is_err() {
+                if result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.contains("引擎请求超时"))
+                {
+                    return Err(
+                        "保存回执超时，本地凭据已保留。请重新打开设置核对配置，再决定是否重试。"
+                            .into(),
+                    );
+                }
+                credentials::save(&app2, &old)
+                    .map_err(|_| "配置保存失败，且凭据回滚失败，请重新打开设置核对")?;
+            }
+            return result;
+        }
+        if method2 == "providers.delete" {
+            let _lock = state.credentials_lock.lock().map_err(|e| e.to_string())?;
+            let id = params
+                .get("providerId")
+                .and_then(Value::as_str)
+                .ok_or("供应商ID缺失")?
+                .to_string();
+            let mut entries = credentials::load(&app2)?;
+            let result = Engine::call(&app2, &state, &method2, params)?;
+            entries.remove(&id);
+            credentials::save(&app2, &entries)?;
+            return Ok(result);
+        }
+        if matches!(method2.as_str(), "projects.select" | "storage.clear-all") {
+            restore_system_proxy(&state, false)
+                .map_err(|error| format!("系统代理恢复失败，未执行切换或清理: {error}"))?;
+        }
+        if matches!(
+            method2.as_str(),
+            "agent.send" | "agent.continue" | "providers.test" | "providers.capabilities"
+        ) {
+            let _lock = state.credentials_lock.lock().map_err(|e| e.to_string())?;
+            credentials::inject(&app2, &method2, &mut params)?;
+        }
+        let key = params
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Engine::call(&app2, &state, &method2, params).map_err(|error| {
+            if key.is_empty() {
+                error
+            } else {
+                error.replace(&key, "[REDACTED]")
+            }
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -337,30 +456,31 @@ fn save_bytes_file(file_name: String, content: Vec<u8>) -> Result<Option<String>
 }
 
 #[tauri::command]
-fn secret_set(account: String, secret: String) -> Result<(), String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &account)
-        .map_err(|e| e.to_string())?
-        .set_password(&secret)
-        .map_err(|e| e.to_string())
+fn credential_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account: String,
+) -> Result<Value, String> {
+    let _lock = state.credentials_lock.lock().map_err(|e| e.to_string())?;
+    let entries = credentials::load(&app)?;
+    let key = entries.get(&account);
+    Ok(
+        json!({"saved": key.is_some(), "storage": "local-file", "characters": key.map(|v| v.chars().count())}),
+    )
 }
 
 #[tauri::command]
-fn secret_get(account: String) -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account).map_err(|e| e.to_string())?;
-    match entry.get_password() {
-        Ok(secret) => Ok(Some(secret)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-#[tauri::command]
-fn secret_delete(account: String) -> Result<(), String> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, &account).map_err(|e| e.to_string())?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+fn credential_reveal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account: String,
+) -> Result<String, String> {
+    // Called only from the explicit reveal button; never injected into engine RPC.
+    let _lock = state.credentials_lock.lock().map_err(|e| e.to_string())?;
+    credentials::load(&app)?
+        .get(&account)
+        .cloned()
+        .ok_or_else(|| "此供应商尚未保存密钥".into())
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
@@ -599,9 +719,8 @@ pub fn run() {
             read_text_file,
             save_text_file,
             save_bytes_file,
-            secret_set,
-            secret_get,
-            secret_delete,
+            credential_status,
+            credential_reveal,
             local_proxy_status,
             local_proxy_enable,
             local_proxy_disable,

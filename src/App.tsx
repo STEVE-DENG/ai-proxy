@@ -1,5 +1,10 @@
+import { StartupScreen } from "./components/StartupScreen";
+import { DeviceStatusBar } from "./components/DeviceStatusBar";
+import { HelpDialog } from "./components/HelpDialog";
+import { OperationCenter } from "./components/OperationFeedback";
+import { DiagnosticCopy } from "./components/DiagnosticCopy";
 import { AlertTriangle, LoaderCircle, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AIWorkspace, type LiveRun, type ScopeChoice } from "./components/AIWorkspace";
 import { CaptureWorkspace } from "./components/CaptureWorkspace";
 import {
@@ -18,12 +23,14 @@ import {
   WaterfallDialog,
 } from "./components/InspectionDialogs";
 import { TopBar } from "./components/TopBar";
-import { WorkbenchDialog } from "./components/WorkbenchDialog";
+import { DeferredPanel } from "./components/DeferredPanel";
+const WorkbenchDialog = lazy(() => import("./components/WorkbenchDialog").then(module => ({default: module.WorkbenchDialog})));
 import {
   confirmAction,
+  agentIssue,
+  type AgentIssue,
   call,
   enableLocalProxy,
-  getSecret,
   localProxyStatus,
   onEngine,
   pickLocalFile,
@@ -260,6 +267,7 @@ async function loadAllRunEvents(runId: string): Promise<RunEvent[]> {
 }
 
 export default function App() {
+  const [bootStage, setBootStage] = useState("engine");
   const [booted, setBooted] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
   const [view, setView] = useState<View>(() =>
@@ -296,16 +304,22 @@ export default function App() {
   const [uiState, setUiState] = useState<CaptureUiState>(DEFAULT_UI_STATE);
   const [inlineOpen, setInlineOpen] = useState(false);
   const [relations, setRelations] = useState<RelationPayload | null>(null);
+  const [relationsLoading, setRelationsLoading] = useState(false);
+  const [relationsError, setRelationsError] = useState<string | null>(null);
+  const relationsGeneration = useRef(0);
+  const relationsFlight = useRef<string | null>(null);
 
   const [liveRuns, setLiveRuns] = useState<Record<string, LiveRun>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [agentRunning, setAgentRunning] = useState(false);
-  const [agentError, setAgentError] = useState<string | null>(null);
+  const [agentError, setAgentIssue] = useState<AgentIssue | null>(null);
+  const setAgentError = useCallback((reason: unknown) => setAgentIssue(reason == null ? null : agentIssue(reason)), []);
   const [composerRefs, setComposerRefs] = useState<RequestRef[]>([]);
   const [autoApply, setAutoApply] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState(() => localStorage.getItem("ai-proxy-provider") || "");
   const [runs, setRuns] = useState<AnalysisRun[]>([]);
-  const [reports, setReports] = useState<Report[]>([]);
+  const [reports, setReports] = useState<import("./types").ReportSummary[]>([]);
+  const [reportTotal, setReportTotal] = useState(0);
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [scope, setScope] = useState<AnalysisScope | null>(null);
@@ -339,10 +353,31 @@ export default function App() {
   const [ruleDialog, setRuleDialog] = useState(false);
   const [ruleDraft, setRuleDraft] = useState<RuleDraft | null>(null);
   const [phoneDialog, setPhoneDialog] = useState(false);
+  const [helpDialog, setHelpDialog] = useState(() => localStorage.getItem("ai-proxy-onboarding") !== "seen");
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "/") { event.preventDefault(); setHelpDialog(current => !current); }
+    };
+    window.addEventListener("keydown", shortcut);
+    return () => window.removeEventListener("keydown", shortcut);
+  }, []);
   const [throttleDialog, setThrottleDialog] = useState(false);
   const [settingsDialog, setSettingsDialog] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"providers" | "capture" | "cert" | "storage">("providers");
+  const openSettings = (tab: "providers" | "capture" | "cert" | "storage" = "providers") => { setSettingsTab(tab); setSettingsDialog(true); };
+  const pendingSend = useRef<{signature: string; operationId: string} | null>(null);
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workbenchVisited, setWorkbenchVisited] = useState(false);
+  useEffect(() => { if (workbenchOpen) setWorkbenchVisited(true); }, [workbenchOpen]);
   const [workbenchTab, setWorkbenchTab] = useState("environments");
+  useEffect(() => {
+    const history = () => {
+      setSettingsDialog(false); setHelpDialog(false); setPhoneDialog(false); setRuleDialog(false); setThrottleDialog(false);
+      setWorkbenchTab("qa:history"); setWorkbenchOpen(true);
+    };
+    window.addEventListener("ai-proxy-operation-history", history);
+    return () => window.removeEventListener("ai-proxy-operation-history", history);
+  }, []);
   const [captureBusy, setCaptureBusy] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [toast, setToast] = useState<Toast | null>(null);
@@ -352,6 +387,9 @@ export default function App() {
   const filtersRef = useRef(filters);
   const requestPageRef = useRef(requestPage);
   const selectedRef = useRef(selected);
+  const detailGeneration = useRef(0);
+  const detailRefreshFlight = useRef<string | null>(null);
+  const lastLossNotice = useRef({ reason: "", at: 0 });
   const sessionIdRef = useRef<string | null>(null);
   const scopeRef = useRef<AnalysisScope | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
@@ -381,7 +419,7 @@ export default function App() {
   useEffect(() => {
     if (!toast) return;
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), 5000);
+    if (toast.tone !== "error") toastTimer.current = window.setTimeout(() => setToast(null), 5000);
     return () => { if (toastTimer.current) window.clearTimeout(toastTimer.current); };
   }, [toast]);
   useEffect(() => {
@@ -428,7 +466,7 @@ export default function App() {
     const id = sessionId || sessionIdRef.current;
     if (!id) return null;
     const result = await call<Session>("sessions.get", { sessionId: id });
-    setSession(result);
+    if (id === sessionIdRef.current) setSession(result);
     return result;
   }, []);
 
@@ -458,12 +496,23 @@ export default function App() {
     setFilterOptions(await call<FilterOptions>("requests.filter-options", { batchId: id }));
   }, []);
 
+  const hydrationGeneration = useRef(0), artifactGeneration = useRef(0);
   const hydrateRun = useCallback(async (runId: string) => {
+    const version = ++hydrationGeneration.current;
     const [run, events, runEvidence] = await Promise.all([
       call<AnalysisRun>("agent.run", { runId }),
       loadAllRunEvents(runId),
       call<Evidence[]>("agent.evidence", { runId }),
     ]);
+    const live = liveFromEvents(run, events);
+    setLiveRuns((current) => {
+      if (live.status === "running") return { ...current, [run.sessionId]: live };
+      const next = { ...current };
+      if (next[run.sessionId]?.runId === run.id) delete next[run.sessionId];
+      return next;
+    });
+    if (run.sessionId !== sessionIdRef.current || version !== hydrationGeneration.current) return run;
+    setRuns(current => current.some(item => item.id === run.id) ? current.map(item => item.id === run.id ? run : item) : [...current, run]);
     setActiveRunId(run.id);
     localStorage.setItem(`ai-proxy-active-run:${run.sessionId}`, run.id);
     activeRunIdRef.current = run.id;
@@ -474,28 +523,30 @@ export default function App() {
     setBudget(run.budget);
     setUsage(run.usage);
     setMode(run.mode);
-    const live = liveFromEvents(run, events);
-    setLiveRuns((current) => {
-      if (live.status === "running") return { ...current, [run.sessionId]: live };
-      const next = { ...current };
-      if (next[run.sessionId]?.runId === run.id && run.status === "completed") delete next[run.sessionId];
-      return next;
-    });
     return run;
   }, []);
 
   const refreshArtifacts = useCallback(async (sessionId?: string, preferredRunId?: string | null) => {
+    const version = ++artifactGeneration.current;
     const id = sessionId || sessionIdRef.current;
     if (!id) return;
     const [items, reportItems] = await Promise.all([
       call<AnalysisRun[]>("agent.runs", { sessionId: id }),
-      call<Report[]>("reports.list", { sessionId: id }),
+      call<{items: import("./types").ReportSummary[]; total: number}>("reports.history", { sessionId: id, limit: 8 }),
     ]);
-    if (id !== sessionIdRef.current) return;
+    if (id !== sessionIdRef.current || version !== artifactGeneration.current) return;
     setRuns(items);
-    setReports(reportItems);
+    setReports(reportItems.items); setReportTotal(reportItems.total);
     const preferred = preferredRunId || activeRunIdRef.current || localStorage.getItem(`ai-proxy-active-run:${id}`);
-    const run = items.find((item) => item.id === preferred) || items[0];
+    let run = items.find((item) => item.id === preferred);
+    if (!run && preferred) {
+      try {
+        const saved = await call<AnalysisRun>("agent.run", {runId: preferred});
+        if (saved.sessionId === id) run = saved;
+      } catch { /* Deleted historical choices fall back to the latest record. */ }
+    }
+    if (id !== sessionIdRef.current || version !== artifactGeneration.current) return;
+    run ||= items[0];
     if (run) {
       await hydrateRun(run.id);
     } else {
@@ -542,28 +593,44 @@ export default function App() {
   }, []);
 
   const scheduleRequestReload = useCallback(() => {
-    if (requestReloadTimer.current) window.clearTimeout(requestReloadTimer.current);
+    if (requestReloadTimer.current) return;
     requestReloadTimer.current = window.setTimeout(() => {
+      requestReloadTimer.current = null;
       void refreshRequestPage().catch((reason) => setCaptureError(String(reason)));
-    }, 220);
+    }, 500);
   }, [refreshRequestPage]);
 
   const refreshSelectedDetail = useCallback(async (requestId: string) => {
+    if (detailRefreshFlight.current === requestId) return;
+    detailRefreshFlight.current = requestId;
+    const generation = detailGeneration.current;
     try {
       const result = await call<RequestDetail>("requests.detail", { requestId });
-      if (selectedRef.current?.id === requestId) {
+      if (generation === detailGeneration.current && selectedRef.current?.id === requestId) {
         setSelected(result);
         setDetail(result);
       }
     } catch {
       // The selected row may have been removed by a concurrent batch cleanup.
+    } finally {
+      if (detailRefreshFlight.current === requestId) detailRefreshFlight.current = null;
     }
   }, []);
 
   useEffect(() => {
     let mounted = true;
+    const listeners: Array<() => void> = [];
     const initialize = async () => {
       try {
+        for (const [event, handler] of [
+          ["app:initializing", (value: {stage: string}) => { if (mounted) setBootStage(value.stage); }],
+          ["engine-ready", () => { if (mounted) setBootStage("workspace"); }],
+          ["engine-boot-error", (reason: unknown) => { if (mounted) setBootError(String(reason)); }],
+        ] as const) {
+          const release = await onEngine(event, handler as (value: unknown) => void);
+          if (!mounted) { release(); return; }
+          listeners.push(release);
+        }
         const data = await call<BootstrapData>("app.bootstrap");
         if (!mounted) return;
         setCapture(data.capture);
@@ -599,16 +666,22 @@ export default function App() {
         filtersRef.current = restoredFilters;
         setFilters(restoredFilters);
         try { setMultiSelected(JSON.parse(localStorage.getItem(`${uiStorageKey(data.currentBatch.id)}:selection`) || "[]")); } catch { setMultiSelected([]); }
-        await refreshHostProxy();
+        setBootStage("workspace");
         setBooted(true);
-        await refreshArtifacts(data.currentSession.id, data.agent.runId);
-        await refreshRequestPage(data.currentBatch.id);
+        // The initial payload already renders a usable workspace. Optional status
+        // and history reads must neither delay it nor replace it with a boot error.
+        const reads = await Promise.allSettled([
+          refreshHostProxy(), refreshArtifacts(data.currentSession.id, data.agent.runId), refreshRequestPage(data.currentBatch.id),
+        ]);
+        if (mounted && reads.some(result => result.status === "rejected")) {
+          setCaptureError("工作区已打开，部分历史或代理状态读取失败；请在对应功能重试，原数据保留。");
+        }
       } catch (reason) {
         if (mounted) setBootError(String(reason));
       }
     };
     void initialize();
-    return () => { mounted = false; };
+    return () => { mounted = false; listeners.forEach(release => release()); };
   }, [refreshArtifacts, refreshHostProxy, refreshRequestPage]);
 
   useEffect(() => {
@@ -626,7 +699,10 @@ export default function App() {
       }));
       cleanup.push(await onEngine<{ reason: string; total: number; requestId?: string }>("capture:record-loss", (value) => {
         setCapture((current) => ({ ...current, captureLoss: value.total, lastRecordLossReason: value.reason }));
-        notify(`采集中途发生背压丢失（${value.reason}），累计 ${value.total} 条。`, "error");
+        if (lastLossNotice.current.reason !== value.reason || Date.now() - lastLossNotice.current.at > 5000) {
+          lastLossNotice.current = { reason: value.reason, at: Date.now() };
+          notify(`${value.reason === "persist-failed" ? "采集记录写入失败" : "采集写入队列已满"}，累计 ${value.total} 次。`, "error");
+        }
       }));
       cleanup.push(await onEngine<ThrottleStatus>("proxy:throttle", (value) => setThrottle(value)));
       cleanup.push(await onEngine<Rule[]>("rules:changed", (value) => setRules(value)));
@@ -654,6 +730,8 @@ export default function App() {
       }));
       cleanup.push(await onEngine<{ sessionId: string; runId: string; scope?: AnalysisScope; mode?: "analysis" | "debug" }>("agent:started", (value) => {
         setAgentRunning(true);
+        setLiveRuns((current) => ({ ...current, [value.sessionId]: { content: "", tools: [], status: "running", runId: value.runId } }));
+        if (value.sessionId !== sessionIdRef.current) return;
         setAgentError(null);
         setActiveRunId(value.runId);
         activeRunIdRef.current = value.runId;
@@ -662,7 +740,6 @@ export default function App() {
           scopeRef.current = value.scope;
         }
         if (value.mode) setMode(value.mode);
-        setLiveRuns((current) => ({ ...current, [value.sessionId]: { content: "", tools: [], status: "running", runId: value.runId } }));
       }));
       cleanup.push(await onEngine<RunEvent>("agent:event", (event) => {
         if (event.runId !== activeRunIdRef.current) return;
@@ -731,9 +808,9 @@ export default function App() {
         notify("Agent 已停止。已经生效的配置不会被自动撤销。");
         await refreshArtifacts(value.sessionId, activeRunIdRef.current || value.runId);
       }));
-      cleanup.push(await onEngine<{ sessionId: string; runId: string; message: Message; error: string }>("agent:error", async (value) => {
+      cleanup.push(await onEngine<{ sessionId: string; runId: string; message: Message; error: string; code?: string }>("agent:error", async (value) => {
         setAgentRunning(false);
-        setAgentError(value.error);
+        if (value.sessionId === sessionIdRef.current) setAgentError({ message: value.error, code: value.code || "internal" });
         setApprovals((current) => current.filter((item) => item.sessionId !== value.sessionId));
         if (value.sessionId === sessionIdRef.current) {
           setSession((current) => current ? mergeMessage(current, value.message) : current);
@@ -749,6 +826,12 @@ export default function App() {
       cleanup.push(await onEngine<{ sessionId: string }>("agent:idle", () => setAgentRunning(false)));
       cleanup.push(await onEngine<{ requestId: string; action: string; payload: { port?: number } }>("agent:host-action", async (value) => {
         try {
+          if (value.action === "phone_guide") {
+            setPhoneDialog(true);
+            await call("agent.host-result", { requestId: value.requestId, ok: true, result: { opened: true } });
+            return;
+          }
+          if (!["local_proxy_enable", "local_proxy_restore"].includes(value.action)) throw new Error("未知本机操作");
           const result = value.action === "local_proxy_enable"
             ? await enableLocalProxy(Number(value.payload.port || 8080))
             : await restoreLocalProxy();
@@ -770,7 +853,11 @@ export default function App() {
   useEffect(() => {
     if (!booted || !currentBatch.id) return;
     const timer = window.setTimeout(() => {
+      relationsGeneration.current += 1;
+      relationsFlight.current = null;
       setRelations(null);
+      setRelationsError(null);
+      setRelationsLoading(false);
       void refreshRequestPage().catch((reason) => setCaptureError(String(reason)));
       void refreshFilterOptions().catch(() => undefined);
     }, 180);
@@ -778,6 +865,7 @@ export default function App() {
   }, [booted, filters, currentBatch.id, refreshFilterOptions, refreshRequestPage]);
 
   const selectRequest = async (request: RequestSummary) => {
+    const generation = ++detailGeneration.current;
     setEvidenceTarget(null);
     setSelected(request);
     selectedRef.current = request;
@@ -786,23 +874,29 @@ export default function App() {
     setUiState((current) => ({ ...current, selectedId: request.id }));
     try {
       const result = await call<RequestDetail>("requests.detail", { requestId: request.id });
+      if (generation !== detailGeneration.current) return;
       setDetail(result);
+      setSelected(result);
+      selectedRef.current = result;
     } catch (reason) {
-      setCaptureError(String(reason));
+      if (generation === detailGeneration.current) setCaptureError(String(reason));
     } finally {
-      setDetailLoading(false);
+      if (generation === detailGeneration.current) setDetailLoading(false);
     }
   };
 
   const selectRequestById = useCallback(async (requestId: string) => {
     if (!requestId) return;
+    const generation = ++detailGeneration.current;
     setView("capture");
     setDetailLoading(true);
     try {
       const result = await call<RequestDetail>("requests.detail", { requestId });
+      if (generation !== detailGeneration.current) return;
       let baseOpenNodes = uiState.openNodes;
       if (result.batchId !== batchRef.current) {
         const selectedBatch = await call<BatchSelectResult>("batches.select", { batchId: result.batchId });
+        if (generation !== detailGeneration.current) return;
         batchRef.current = selectedBatch.batch.id;
         setCurrentBatch(selectedBatch.batch);
         setScenarios(selectedBatch.scenarios);
@@ -812,28 +906,21 @@ export default function App() {
         baseOpenNodes = restored.openNodes;
         setUiState(restored);
       }
-      const hasActiveFilter = Boolean(
-        filtersRef.current.query
-        || filtersRef.current.method
-        || filtersRef.current.status
-        || filtersRef.current.sourceIp
-        || filtersRef.current.host
-        || filtersRef.current.environment
-        || filtersRef.current.traceId
-        || filtersRef.current.errorsOnly
-        || filtersRef.current.startedAfter
-        || filtersRef.current.startedBefore,
-      );
-      const inCurrentPage = requestPageRef.current.items.some((item) => item.id === result.id);
-      if (hasActiveFilter && !inCurrentPage) {
-        sessionStorage.setItem(evidenceReturnKey(), JSON.stringify({ batchId: batchRef.current, filters: filtersRef.current, ui: uiState }));
-        filtersRef.current = { ...DEFAULT_FILTERS };
-        setFilters({ ...DEFAULT_FILTERS });
+      const hasActiveFilter = Object.values(filtersRef.current).some(value => value !== "" && value !== null && value !== undefined && value !== false);
+      if (hasActiveFilter) {
+        const matched = await call<RequestPage>("requests.query", { batchId: result.batchId, ...filtersRef.current, includeIds: [result.id], limit: 1 });
+        if (generation !== detailGeneration.current) return;
+        if (!matched.matchCount) {
+          sessionStorage.setItem(evidenceReturnKey(), JSON.stringify({ batchId: batchRef.current, filters: filtersRef.current, ui: uiState }));
+          filtersRef.current = { ...DEFAULT_FILTERS };
+          setFilters({ ...DEFAULT_FILTERS });
+        }
       }
       const pathname = result.path.split("?")[0] || "/";
       const segments = pathname.split("/").filter(Boolean);
       const defaultPort = result.scheme === "https" ? 443 : 80;
-      const root = `${result.scheme}://${result.host}${result.port === defaultPort ? "" : `:${result.port}`}`;
+      const host = result.host.includes(":") && !result.host.startsWith("[") ? `[${result.host}]` : result.host;
+      const root = `${result.scheme}://${host}${result.port === defaultPort ? "" : `:${result.port}`}`;
       const openNodes = { ...baseOpenNodes, [root]: true };
       let accumulated = "";
       for (const segment of segments) {
@@ -858,9 +945,9 @@ export default function App() {
         };
       });
     } catch (reason) {
-      notify(String(reason), "error");
+      if (generation === detailGeneration.current) notify(String(reason), "error");
     } finally {
-      setDetailLoading(false);
+      if (generation === detailGeneration.current) setDetailLoading(false);
     }
   }, [notify, uiState.openNodes]);
 
@@ -922,10 +1009,9 @@ export default function App() {
       let status = capture;
       if (!status.lan) status = await call<CaptureStatus>("capture.set-lan", { lan: true });
       if (!status.running) status = await call<CaptureStatus>("capture.start", { port: listenPort, lan: true });
-      if (!status.decryptHosts.includes("*")) status = await call<CaptureStatus>("decrypt.set", { host: "*", enabled: true });
       setCapture(status);
       setCertificate(await call<CertificateInfo>("certificate.info"));
-      notify(`手机接入已开启：${status.localIp}:${status.port}。请在手机安装并完全信任 CA。`);
+      notify(`手机接入已开启：${status.localIp}:${status.port}。先配置手机 Wi-Fi 代理并验证 HTTP；HTTPS 可稍后开启。`);
     } catch (reason) {
       setCaptureError(String(reason));
       notify(`开启手机抓包失败：${reason}`, "error");
@@ -973,10 +1059,17 @@ export default function App() {
     setScenarios(result.scenarios);
     setFilterOptions(result.filterOptions);
     setRequestPage({ ...result.requestPage, sort: "asc", items: result.requests });
+    detailGeneration.current += 1;
+    selectedRef.current = null;
     setSelected(null);
     setDetail(null);
+    setDetailLoading(false);
     setMultiSelected([]);
+    relationsGeneration.current += 1;
+    relationsFlight.current = null;
     setRelations(null);
+    setRelationsError(null);
+    setRelationsLoading(false);
     setUiState(readUiState(id));
     filtersRef.current = readFilters(id);
     setFilters(filtersRef.current);
@@ -993,8 +1086,11 @@ export default function App() {
     setRequestPage(EMPTY_PAGE);
     setScenarios([]);
     setFilterOptions({ devices: [], hosts: [], environments: [] });
+    detailGeneration.current += 1;
+    selectedRef.current = null;
     setSelected(null);
     setDetail(null);
+    setDetailLoading(false);
     setMultiSelected([]);
     setUiState({ ...DEFAULT_UI_STATE });
   };
@@ -1007,10 +1103,17 @@ export default function App() {
     setBatches(await call("batches.list"));
     setScenarios([]);
     setRequestPage(EMPTY_PAGE);
+    detailGeneration.current += 1;
+    selectedRef.current = null;
     setSelected(null);
     setDetail(null);
+    setDetailLoading(false);
     setMultiSelected([]);
+    relationsGeneration.current += 1;
+    relationsFlight.current = null;
     setRelations(null);
+    setRelationsError(null);
+    setRelationsLoading(false);
     setEvidence([]);
     setUiState(current => ({ ...current, selectedId: null, openNodes: {}, scrollTop: 0, listPositions: {}, treePageOffsets: {} }));
     await Promise.all([refreshStorage(), refreshArtifacts(), refreshFilterOptions()]);
@@ -1045,13 +1148,17 @@ export default function App() {
     }
   };
 
+  const sessionSelectionGeneration = useRef(0);
   const newSession = async () => {
+    const sequence = ++sessionSelectionGeneration.current;
     const created = await call<Session>("sessions.create");
+    if (sequence !== sessionSelectionGeneration.current) return;
     setSession(created);
     sessionIdRef.current = created.id;
     setComposerRefs([]);
+    setAgentError(null);
     setRuns([]);
-    setReports([]);
+    setReports([]); setReportTotal(0);
     setRunEvents([]);
     setEvidence([]);
     setScope(null);
@@ -1060,9 +1167,13 @@ export default function App() {
   };
 
   const selectSession = async (id: string) => {
+    const sequence = ++sessionSelectionGeneration.current;
     setAgentError(null);
     const result = await call<Session>("sessions.get", { sessionId: id });
+    if (sequence !== sessionSelectionGeneration.current) return;
     setSession(result);
+    setReports([]); setReportTotal(0); setRuns([]); setActiveRunId(null);
+    activeRunIdRef.current = null; setRunEvents([]); setEvidence([]); setScope(null); scopeRef.current = null; setUsage(null);
     sessionIdRef.current = id;
     setComposerRefs([]);
     await refreshArtifacts(id);
@@ -1096,8 +1207,6 @@ export default function App() {
       scenarioId,
       mode: "snapshot",
     });
-    setScope(result);
-    scopeRef.current = result;
     return result;
   }, []);
 
@@ -1107,48 +1216,66 @@ export default function App() {
     refs: RequestRef[],
     parentRunId?: string,
   ) => {
-    if (!sessionIdRef.current) return;
+    const targetSession = sessionIdRef.current;
+    if (!targetSession) return false;
     if (!selectedProviderId) {
+      setSettingsTab("providers");
       setSettingsDialog(true);
-      setAgentError("请先配置供应商");
-      return;
+      setAgentError({ message: "请先配置供应商", code: "provider_missing" });
+      return false;
     }
     setAgentError(null);
     setScope(analysisScope);
     scopeRef.current = analysisScope;
+    const pendingKey = `ai-proxy-pending-send:${sessionIdRef.current}`;
+    const signature = JSON.stringify([sessionIdRef.current, text, parentRunId, analysisScope.batchId, analysisScope.filters, analysisScope.selectedIds, refs.map(item => item.id), mode, selectedProviderId]);
+    let operationId = pendingSend.current?.signature === signature ? pendingSend.current.operationId : crypto.randomUUID();
+    try { const previous = JSON.parse(localStorage.getItem(pendingKey) || "null"); if (previous?.signature === signature) operationId = previous.operationId; } catch { /* Use a fresh identity when no pending draft can be restored. */ }
+    pendingSend.current = { signature, operationId };
+    try { localStorage.setItem(pendingKey, JSON.stringify({ signature, operationId })); } catch { /* Keep the pending identity in memory when storage is full. */ }
     try {
-      const apiKey = await getSecret(selectedProviderId).catch(() => null);
       const result = parentRunId
         ? await call<{ runId: string; sessionId: string }>("agent.continue", {
             runId: parentRunId,
+            operationId,
             text,
             providerId: selectedProviderId,
-            apiKey: apiKey || "",
             autoApply: mode === "debug" && autoApply,
             budget,
           })
         : await call<{ runId: string; sessionId: string }>("agent.send", {
             sessionId: sessionIdRef.current,
+            operationId,
             text,
             refs,
             scope: analysisScope,
             providerId: selectedProviderId,
-            apiKey: apiKey || "",
             autoApply: mode === "debug" && autoApply,
             mode,
             budget,
           });
-      setComposerRefs([]);
       setAgentRunning(true);
-      setActiveRunId(result.runId);
-      activeRunIdRef.current = result.runId;
+      if (sessionIdRef.current === result.sessionId) {
+        setComposerRefs([]);
+        setActiveRunId(result.runId);
+        activeRunIdRef.current = result.runId;
+      }
       setLiveRuns((current) => ({ ...current, [result.sessionId]: { content: "", tools: [], status: "running", runId: result.runId } }));
-      await refreshSessions();
+      pendingSend.current = null;
+      try { localStorage.removeItem(pendingKey); } catch { /* The run is already created; a storage failure must not turn success into a retry. */ }
+      try {
+        await refreshSessions();
+        await refreshSession(result.sessionId);
+        const latest = await hydrateRun(result.runId);
+        setAgentRunning(["preparing", "running", "waiting_approval", "executing_tool"].includes(latest.status));
+      } catch (reason) { if (sessionIdRef.current === targetSession) setAgentError(`任务已提交，但显示刷新失败：${reason}。请查看执行记录，不要重复发送。`); }
       window.setTimeout(() => { void refreshArtifacts(result.sessionId, result.runId); }, 120);
+      return true;
     } catch (reason) {
-      setAgentError(String(reason));
+      if (sessionIdRef.current === targetSession) setAgentError(reason);
+      return false;
     }
-  }, [autoApply, budget, mode, refreshArtifacts, refreshSessions, selectedProviderId]);
+  }, [autoApply, budget, mode, refreshArtifacts, refreshSessions, refreshSession, hydrateRun, selectedProviderId]);
 
   const scopeInputs = () => {
     const ids = scopeChoice === "selection"
@@ -1163,9 +1290,11 @@ export default function App() {
   };
 
   const sendAgent = async (text: string) => {
+    const targetSession = sessionIdRef.current;
     try {
       const { ids, scenarioId } = scopeInputs();
       const analysisScope = await buildScope(ids, scenarioId);
+      if (sessionIdRef.current !== targetSession) return false;
       const refs = composerRefs.length
         ? composerRefs
         : requestPage.items.filter((item) => ids.includes(item.id)).map((item) => ({
@@ -1174,9 +1303,10 @@ export default function App() {
             url: item.url,
             status: item.status,
           }));
-      await dispatchAgent(text, analysisScope, refs);
+      return await dispatchAgent(text, analysisScope, refs);
     } catch (reason) {
-      setAgentError(String(reason));
+      if (targetSession === sessionIdRef.current) setAgentError(reason);
+      return false;
     }
   };
 
@@ -1185,15 +1315,17 @@ export default function App() {
     request: { filters: CaptureFilters; selectedIds: string[]; scenarioId?: string | null },
   ) => {
     if (isAgentBusy) return;
+    const targetSession = sessionIdRef.current;
     try {
       const analysisScope = await buildScope(request.selectedIds, request.scenarioId ?? null, request.filters);
+      if (targetSession !== sessionIdRef.current) return;
       const refs = request.selectedIds
         .map((id) => requestPage.items.find((item) => item.id === id) || (selected?.id === id ? selected : null))
         .filter((item): item is RequestSummary => Boolean(item))
         .map((item) => ({ id: item.id, method: item.method, url: item.url, status: item.status }));
       await dispatchAgent(text, analysisScope, refs);
     } catch (reason) {
-      setAgentError(String(reason));
+      if (targetSession === sessionIdRef.current) setAgentError(reason);
     }
   };
 
@@ -1206,8 +1338,36 @@ export default function App() {
     );
   };
 
+  const rebuildingScope = useRef(false);
+  const freshScopeRun = async (run: AnalysisRun) => {
+    if (rebuildingScope.current || isAgentBusy || run.sessionId !== sessionIdRef.current) return;
+    const targetSession = run.sessionId;
+    rebuildingScope.current = true;
+    try {
+      const result = await call<{sessionId: string; text: string; scope: AnalysisScope; refs: RequestRef[]; notice: string;
+        diff: {previousCount: number; currentCount: number; added: number; removed: number; changed: number; excludedUnfinished: number; keptRefs: number; removedRefs: number; missingSelected: number; missingSelectedIds: string[]}}>("agent.rebuild-preview", { runId: run.id });
+      if (sessionIdRef.current !== targetSession) return;
+      const d = result.diff;
+      const approved = await confirmAction(`按原条件新建分析，可能产生模型费用。\n原问题：${result.text}\n\n范围 ${d.previousCount} → ${d.currentCount} 条；新增 ${d.added}、移出 ${d.removed}、版本变化 ${d.changed}；排除进行中 ${d.excludedUnfinished} 条。\n原选择缺失或不再匹配 ${d.missingSelected} 条：${d.missingSelectedIds.join("、") || "无"}。仅保留原选择中的剩余请求。\n复用引用 ${d.keptRefs}、移出引用 ${d.removedRefs}。\n${result.notice}`);
+      if (!approved || sessionIdRef.current !== targetSession) return;
+      await dispatchAgent(result.text, result.scope, result.refs);
+    } catch (reason) { if (sessionIdRef.current === targetSession) setAgentError(reason); }
+    finally { rebuildingScope.current = false; }
+  };
+
+  const previewContext = async (text: string) => {
+    const targetSession = sessionIdRef.current;
+    const { ids, scenarioId } = scopeInputs();
+    const next = await buildScope(ids, scenarioId);
+    if (sessionIdRef.current !== targetSession) throw new Error("会话已切换，请在当前会话重新预览");
+    return call<import("./components/AgentContextPanel").InputPreview>("agent.context.preview", {
+      sessionId: targetSession, providerId: selectedProviderId, mode, text, scope: next, refs: composerRefs,
+    });
+  };
+
   const stopAgent = async () => {
-    await call("agent.stop");
+    try { await call("agent.stop"); }
+    catch (reason) { setAgentError(`停止请求失败：${reason}。请检查执行记录与引擎状态。`); }
   };
 
   const resolveApproval = async (approvalId: string, approved: boolean) => {
@@ -1218,7 +1378,7 @@ export default function App() {
   const generateReport = async (run: AnalysisRun) => {
     try {
       const report = await call<Report>("reports.generate", { runId: run.id });
-      setReports((current) => [report, ...current.filter((item) => item.id !== report.id)]);
+      if (run.sessionId === sessionIdRef.current) await refreshArtifacts(run.sessionId);
       notify("已从本轮执行生成报告草稿。");
     } catch (reason) {
       notify(String(reason), "error");
@@ -1227,13 +1387,13 @@ export default function App() {
 
   const saveReport = async (report: Report) => {
     const saved = await call<Report>("reports.save", { ...report });
-    setReports((current) => [saved, ...current.filter((item) => item.id !== saved.id)]);
+    if (saved.sessionId === sessionIdRef.current) await refreshArtifacts(saved.sessionId);
     notify("报告已保存。");
   };
 
   const deleteReport = async (report: Report) => {
     await call("reports.delete", { reportId: report.id });
-    setReports((current) => current.filter((item) => item.id !== report.id));
+    if (report.sessionId === sessionIdRef.current) await refreshArtifacts(report.sessionId);
   };
 
   const exportReport = async (report: Report, format: "markdown" | "json") => {
@@ -1332,16 +1492,28 @@ export default function App() {
     if (traceId) void loadWaterfall(traceId);
   };
 
-  const loadRelations = async () => {
+  const loadRelations = useCallback(async () => {
+    const key = JSON.stringify([batchRef.current, filtersRef.current]);
+    if (relationsFlight.current === key) return;
+    const generation = ++relationsGeneration.current;
+    relationsFlight.current = key;
+    setRelationsLoading(true);
+    setRelationsError(null);
     try {
-      setRelations(await call<RelationPayload>("requests.relations", {
+      const result = await call<RelationPayload>("requests.relations", {
         batchId: batchRef.current,
         ...filtersRef.current,
-      }));
+      });
+      if (generation === relationsGeneration.current && key === JSON.stringify([batchRef.current, filtersRef.current])) setRelations(result);
     } catch (reason) {
-      notify(String(reason), "error");
+      if (generation === relationsGeneration.current) setRelationsError(String(reason));
+    } finally {
+      if (generation === relationsGeneration.current) {
+        relationsFlight.current = null;
+        setRelationsLoading(false);
+      }
     }
-  };
+  }, []);
 
   const startScenario = async (name: string, device: string) => {
     const created = await call<Scenario>("scenarios.start", { batchId: batchRef.current, name, device: device || null });
@@ -1377,6 +1549,7 @@ export default function App() {
   };
 
   const openWorkbench = (tab = "environments") => {
+    if (tab === "help") { setHelpDialog(true); return; }
     setWorkbenchTab(tab);
     setWorkbenchOpen(true);
   };
@@ -1407,27 +1580,8 @@ export default function App() {
   const activeRun = runs.find((item) => item.id === activeRunId) || runs[0] || null;
   const savedFilters = configs.filter((item) => item.kind === "saved_filter" && item.enabled);
 
-  if (bootError) {
-    return (
-      <div className="boot-screen">
-        <div className="boot-mark"><AlertTriangle size={28} /></div>
-        <span className="eyebrow">ENGINE UNAVAILABLE</span>
-        <h1>本地引擎没有启动</h1>
-        <p>{bootError}</p>
-        <button className="button primary" onClick={() => window.location.reload()}>重新连接</button>
-      </div>
-    );
-  }
-
-  if (!booted || !session) {
-    return (
-      <div className="boot-screen">
-        <div className="boot-mark"><LoaderCircle className="spin" size={28} /></div>
-        <span className="eyebrow">STARTING LOCAL ENGINE</span>
-        <h1>AI Proxy</h1>
-        <p>正在打开本地抓包工作区…</p>
-      </div>
-    );
+  if (bootError || !booted || !session) {
+    return <StartupScreen stage={bootStage} error={bootError} />;
   }
 
   return (
@@ -1435,6 +1589,7 @@ export default function App() {
       <TopBar
         projectName={projectName}
         onProject={() => openWorkbench("projects")}
+        onHelp={() => setHelpDialog(true)}
         view={view}
         onView={setView}
         capture={capture}
@@ -1445,9 +1600,10 @@ export default function App() {
         onPhone={() => setPhoneDialog(true)}
         onThrottle={() => setThrottleDialog(true)}
         onRules={() => { setRuleDraft(null); setRuleDialog(true); }}
-        onSettings={() => setSettingsDialog(true)}
+        onSettings={() => openSettings("capture")}
         busy={captureBusy}
       />
+      <DeviceStatusBar key={currentBatch.id} capture={capture} onGuide={() => setPhoneDialog(true)} />
 
       <div className="workspace">
         {view === "ai" ? (
@@ -1468,7 +1624,7 @@ export default function App() {
             onNew={newSession}
             onSelect={selectSession}
             onDelete={deleteSession}
-            onSettings={() => setSettingsDialog(true)}
+            onSettings={() => openSettings()}
             onPickFile={pickFileForSession}
             onApproval={resolveApproval}
             busy={Boolean(isAgentBusy)}
@@ -1476,6 +1632,7 @@ export default function App() {
             runs={runs}
             activeRunId={activeRunId}
             reports={reports}
+            reportTotal={reportTotal}
             events={runEvents}
             evidence={evidence}
             scope={activeRun?.scope || scope || null}
@@ -1487,11 +1644,18 @@ export default function App() {
               if (value === "analysis") setAutoApply(false);
             }}
             scopeChoice={scopeChoice}
+            sourceRevision={JSON.stringify([currentBatch.id, configVersion, rules, providers, scenarios, multiSelected, requestPage.items.map(item => [item.id, item.version])])}
+            pendingScopeSummary={`${projectName} / ${currentBatch.label}；${scopeChoice === "selection" ? `选择 ${multiSelected.length || composerRefs.length} 条` : scopeChoice === "scenario" ? `场景 ${scenarios.find(item => item.status === "active")?.name || "未开始"}，再与当前筛选取交集` : `当前筛选，最近匹配 ${requestPage.matchCount} 条`}；设备 ${filters.sourceIp || "全部"}；${mode === "analysis" ? "只读分析" : `调试模式${autoApply ? "（已开启自动执行）" : "（写操作需审批）"}`}；当前筛选 ${Object.entries(filters).filter(([, value]) => value !== "" && value !== null && value !== false).map(([name, value]) => `${name}=${value}`).join("、") || "无额外条件"}`}
             onScopeChoice={setScopeChoice}
+            onAdjustScope={() => { setView("capture"); setInlineOpen(false); notify("请在抓包区重新勾选请求或调整场景与筛选，再返回分析；草稿和原结果保留。"); }}
             onRunSelect={async (run) => {
+              artifactGeneration.current++;
+              activeRunIdRef.current = run.id;
               await hydrateRun(run.id);
             }}
             onContinue={continueRun}
+            onFreshScope={freshScopeRun}
+            onPreviewContext={previewContext}
             onGenerateReport={generateReport}
             onSaveReport={saveReport}
             onDeleteReport={deleteReport}
@@ -1572,6 +1736,8 @@ export default function App() {
             }}
             onOpenWorkbench={openWorkbench}
             onLoadRelations={loadRelations}
+            relationsLoading={relationsLoading}
+            relationsError={relationsError}
             onAggregate={() => {
               setAggregateOpen(true);
               void loadAggregate(aggregateGroupBy);
@@ -1613,9 +1779,21 @@ export default function App() {
 
       <RulesDialog open={ruleDialog} rules={rules} draft={ruleDraft} onClose={() => setRuleDialog(false)} onChanged={refreshRules} />
       <ThrottleDialog open={throttleDialog} value={throttle} onClose={() => setThrottleDialog(false)} onSave={saveThrottle} />
+      <HelpDialog open={helpDialog} onClose={() => { localStorage.setItem("ai-proxy-onboarding", "seen"); setHelpDialog(false); }} onNavigate={route => {
+        localStorage.setItem("ai-proxy-onboarding", "seen"); setHelpDialog(false);
+        if (route === "phone") setPhoneDialog(true);
+        else if (route === "ai" || route === "capture") setView(route);
+        else if (route === "local") { setView("capture"); openSettings("capture"); }
+        else if (route === "settings") openSettings();
+        else if (route === "storage") openSettings("storage");
+        else if (route === "rules") setRuleDialog(true);
+        else if (route === "throttle") setThrottleDialog(true);
+        else openWorkbench(route);
+      }} />
       <PhoneDialog open={phoneDialog} capture={capture} certificate={certificate} onClose={() => setPhoneDialog(false)} onLan={toggleLan} onHttps={(enabled) => setDecrypt("*", enabled)} onEnable={enablePhoneCapture} />
       <SettingsDialog
         open={settingsDialog}
+        initialTab={settingsTab}
         providers={providers}
         selectedProviderId={selectedProviderId}
         onProvider={setSelectedProviderId}
@@ -1632,7 +1810,7 @@ export default function App() {
         onRefreshStorage={refreshStorage}
         onClose={() => { setSettingsDialog(false); void refreshHostProxy(); }}
       />
-      <WorkbenchDialog
+      {(workbenchOpen || workbenchVisited) && <DeferredPanel open={workbenchOpen} onClose={() => setWorkbenchOpen(false)}><WorkbenchDialog
         open={workbenchOpen}
         initialTab={workbenchTab}
         onClose={() => setWorkbenchOpen(false)}
@@ -1651,7 +1829,7 @@ export default function App() {
           setWorkbenchOpen(false);
           void selectRequestById(requestId);
         }}
-      />
+      /></DeferredPanel>}
       <ComparisonDialog open={diffOpen} comparison={comparison} loading={diffLoading} onEvidence={(id, direction, locator, version) => { setDiffOpen(false); void openEvidence(id, direction, locator, version); }} onClose={() => setDiffOpen(false)} />
       <ScenarioCompareDialog
         open={scenarioCompareOpen}
@@ -1707,6 +1885,7 @@ export default function App() {
       <ChecklistDialog open={checklistOpen} result={checklist} loading={checklistLoading} onClose={() => setChecklistOpen(false)} />
 
       <div className="runtime-facts">
+        <OperationCenter onHistory={() => openWorkbench("qa:history")} />
         <span>配置版本 {configVersion ? configVersion.slice(0, 10) : "—"}</span>
         {sessionStorage.getItem(evidenceReturnKey()) && <button className="button ghost compact" onClick={async () => { try { const saved = JSON.parse(sessionStorage.getItem(evidenceReturnKey()) || "null"); if (!saved) return; if (saved.batchId !== currentBatch.id) await selectBatch(saved.batchId); filtersRef.current = saved.filters; setFilters(saved.filters); setUiState(saved.ui); setEvidenceTarget(null); setView("capture"); sessionStorage.removeItem(evidenceReturnKey()); } catch (reason) { notify(String(reason), "error"); } }}>返回证据跳转前的筛选</button>}
         <span>{activeRun ? `Run ${activeRun.status}` : "无活动 Run"}</span>
@@ -1717,6 +1896,7 @@ export default function App() {
         <div className={`toast ${toast.tone}`} key={toast.id}>
           {toast.tone === "error" ? <AlertTriangle size={16} /> : <span className="toast-dot" />}
           <span>{toast.message}</span>
+          {toast.tone === "error" && <DiagnosticCopy area={view} runId={view === "ai" ? activeRunId : null} status="error" />}
           <button onClick={() => setToast(null)}><X size={14} /></button>
         </div>
       )}

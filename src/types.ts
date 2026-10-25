@@ -1,5 +1,5 @@
 export type View = "ai" | "capture";
-export type CaptureView = "structure" | "timeline" | "relations";
+export type CaptureView = "structure" | "directories" | "timeline" | "relations";
 
 export interface CaptureFilters {
   query: string;
@@ -26,6 +26,11 @@ export interface CaptureUiState {
 }
 
 export interface CaptureStatus {
+  timeoutSettings?: CaptureTimeoutSettings;
+  http2TimeoutIsolation?: string;
+  listenerReady?: boolean;
+  engineReady?: boolean;
+  selectedAddressMissing?: boolean;
   running: boolean;
   paused: boolean;
   port: number;
@@ -43,6 +48,12 @@ export interface CaptureStatus {
   certPort?: number | null;
   certDirectUrl?: string | null;
   lastTlsError: string | null;
+}
+
+export interface CaptureTimeoutSettings {
+  requestTimeoutSeconds: number;
+  streamIdleTimeoutSeconds: number;
+  http2Enabled: boolean;
 }
 
 export interface Batch {
@@ -234,6 +245,7 @@ export interface ThrottleStatus {
 }
 
 export interface Provider {
+  cachePolicy?: "auto" | "enabled" | "off";
   id: string;
   name: string;
   protocol: "openai-responses" | "openai-chat" | "anthropic";
@@ -285,6 +297,8 @@ export interface AnalysisScope {
   startedAfter?: number | null;
   startedBefore?: number | null;
   unfinishedCount?: number;
+  matchedCountAtCreation?: number;
+  excludedUnfinishedCount?: number;
   expired?: boolean;
 }
 
@@ -307,6 +321,8 @@ export interface Message {
 }
 
 export interface RunUsage {
+  cacheReadTokens?: number | null;
+  cacheWriteTokens?: number | null;
   requests?: number | null;
   toolCalls?: number | null;
   inputTokens?: number | null;
@@ -337,6 +353,9 @@ export type RunStatus =
   | "interrupted";
 
 export interface AnalysisRun {
+  taskText?: string | null;
+  continuationDepth?: number;
+  rootTaskMissing?: boolean;
   id: string;
   sessionId: string;
   parentRunId: string | null;
@@ -509,6 +528,7 @@ export interface HostAction {
 }
 
 export interface CertificateInfo {
+  fingerprint?: string | null;
   path: string;
   exists: boolean;
   url: string;
@@ -761,3 +781,5 @@ export interface ChecklistResult {
   }>;
   note: string;
 }
+
+export type ReportSummary = Pick<Report, "id" | "sessionId" | "runId" | "title" | "status" | "createdAt" | "updatedAt">;

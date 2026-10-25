@@ -1,4 +1,4 @@
-import { Activity, Bot, FileCode2, Radio, ShieldCheck, SlidersHorizontal, Smartphone, WifiOff } from "lucide-react";
+import { Activity, CircleHelp, Bot, FileCode2, Radio, ShieldCheck, SlidersHorizontal, Smartphone, WifiOff } from "lucide-react";
 import type { CaptureStatus, LocalProxyStatus, ThrottleStatus, View } from "../types";
 
 interface Props {
@@ -13,6 +13,7 @@ interface Props {
   onThrottle: () => void;
   onRules: () => void;
   onSettings: () => void;
+  onHelp: () => void;
   busy: boolean;
   projectName: string;
   onProject: () => void;
@@ -30,6 +31,7 @@ export function TopBar({
   onThrottle,
   onRules,
   onSettings,
+  onHelp,
   busy,
   projectName,
   onProject,
@@ -37,19 +39,19 @@ export function TopBar({
   return (
     <header className="topbar" data-tauri-drag-region>
       <div className="brand" data-tauri-drag-region>
-        <div className="brand-mark"><Activity size={17} strokeWidth={2.4} /></div>
-        <div>
-          <div className="brand-name">AI Proxy</div>
-          <div className="brand-kicker">LOCAL TRAFFIC LAB</div>
+        <div className="brand-mark" data-tauri-drag-region><img src="/brand/app-icon.png" alt="" draggable={false} /></div>
+        <div data-tauri-drag-region>
+          <div className="brand-name" data-tauri-drag-region>AI Proxy</div>
+          <div className="brand-kicker" data-tauri-drag-region>LOCAL TRAFFIC LAB</div>
         </div>
       </div>
 
       <nav className="view-switch" aria-label="工作区">
         <button className={view === "ai" ? "active" : ""} onClick={() => onView("ai")}>
-          <Bot size={15} /> Agent
+          <Bot size={15} /> AI 分析
         </button>
         <button className={view === "capture" ? "active" : ""} onClick={() => onView("capture")}>
-          <FileCode2 size={15} /> Capture
+          <FileCode2 size={15} /> 抓包
         </button>
       </nav>
 
@@ -61,18 +63,19 @@ export function TopBar({
 
       <div className="topbar-actions">
         <button className="button ghost compact project-trigger" title="切换独立项目空间" onClick={onProject}>{projectName}</button>
-        <button className="icon-action" title="规则" onClick={onRules}>
-          <SlidersHorizontal size={17} />
+        <button className="icon-action named-action" title="规则" onClick={onRules}>
+          <SlidersHorizontal size={17} /><span>规则</span>
         </button>
-        <button className={`icon-action ${throttle.enabled ? "active" : ""}`} title="弱网" onClick={onThrottle}>
-          <WifiOff size={17} />
+        <button className={`icon-action named-action ${throttle.enabled ? "active" : ""}`} title="弱网" onClick={onThrottle}>
+          <WifiOff size={17} /><span>弱网</span>
         </button>
-        <button className={`icon-action ${capture.lan ? "active" : ""}`} title="连接手机" onClick={onPhone}>
-          <Smartphone size={17} />
+        <button className={`icon-action named-action ${capture.lan ? "active" : ""}`} title="连接手机" onClick={onPhone}>
+          <Smartphone size={17} /><span>连接手机</span>
         </button>
-        <button className={`icon-action ${hostProxy?.active ? "active" : ""}`} title="本机代理" onClick={onSettings}>
-          <ShieldCheck size={17} />
+        <button className={`icon-action named-action ${hostProxy?.active ? "active" : ""}`} title="本机代理" onClick={onSettings}>
+          <ShieldCheck size={17} /><span>本机代理</span>
         </button>
+        <button className="icon-action named-action" title="功能帮助与显示设置" aria-label="功能帮助与显示设置" onClick={onHelp}><CircleHelp size={17} /><span>帮助</span></button>
         <span className="topbar-divider" />
         {capture.running ? (
           <button className="button ghost compact" onClick={onPause} disabled={busy}>

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Core window access for AI Proxy",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-start-dragging", "core:window:allow-toggle-maximize"]
 }

@@ -7,18 +7,22 @@ import logging
 import os
 import sys
 import threading
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
 from pydantic_ai import Agent
 
 from .qa import QAService
-from .agent import AgentCoordinator, DEFAULT_BUDGET, _build_model
+from .agent import AgentCoordinator, DEFAULT_BUDGET, _build_model, _provider_error
 from .domain import DomainService
 from .privacy import Redactor
 from .proxy import ProxyManager
-from .store import Store, new_id
+from .store import Store, new_id, now_ms
 from .throttle import Throttle
+from .jobs import CANCEL_EVENT
+from .experience import storage_health, compare_performance
+from .errors import AppError, error_code
 
 
 _stdout_lock = threading.Lock()
@@ -51,7 +55,9 @@ class EngineApp:
             self.projects = json.loads(self.project_manifest.read_text())
         active = self.projects.get("active", "default")
         data_dir = self.project_root if active == "default" else self.project_root / "projects" / active
+        emit("app:initializing", {"stage": "storage"})
         self.store = Store(data_dir)
+        self.store.recover_interrupted_requests()
         self.throttle = Throttle()
         self.proxy = ProxyManager(
             self.store,
@@ -65,11 +71,94 @@ class EngineApp:
         self.emit = emit
         self.closing = asyncio.Event()
         self.mutation_lock = asyncio.Lock()
+        self.compose_reads = asyncio.Semaphore(2)
+        self.storage_health_task: asyncio.Task | None = None
         self.store.mark_interrupted_runs()
         self.store.recover_inflight_actions()
         self._load_settings()
+        emit("app:initializing", {"stage": "workspace"})
+
+    def _locate_request(self, params: dict[str, Any]) -> dict[str, Any]:
+        try:
+            request = self.store.request_summary(params["requestId"])
+        except ValueError:
+            return {"status": "deleted"}
+        batch_id = params["batchId"]
+        if request["batchId"] != batch_id:
+            return {"status": "excluded"}
+        page = self.domain.query(batch_id, {**params.get("filters", {}), "includeIds": [request["id"]], "limit": 1})
+        return {"status": "available" if page["items"] else "excluded", "request": request}
+
+    def _original_task(self, run_id: str) -> dict[str, Any]:
+        try:
+            run = self.store.get_run(run_id)
+        except ValueError as error:
+            raise AppError("original_task_missing", "原任务已清理，请重新指定问题；未调用模型。") from error
+        task_run = run
+        seen = {run_id}
+        while task_run.get("parentRunId"):
+            parent = task_run["parentRunId"]
+            if parent in seen or len(seen) >= 64:
+                raise AppError("original_task_missing", "原任务续查链异常，请在输入框重新指定问题")
+            seen.add(parent)
+            try:
+                task_run = self.store.get_run(parent)
+            except ValueError as error:
+                raise AppError("original_task_missing", "原任务已清理，请在输入框重新指定问题；未调用模型。") from error
+            if task_run["sessionId"] != run["sessionId"]:
+                raise AppError("original_task_missing", "原任务续查链跨会话，未创建新分析")
+        with self.store.connect() as db:
+            message = db.execute("SELECT content,meta FROM messages WHERE run_id=? AND role='user' ORDER BY created_at,id LIMIT 1", (task_run["id"],)).fetchone()
+        if not message or not message["content"].strip():
+            raise AppError("original_task_missing", "原任务问题不存在，请复制你要分析的问题到输入框并重新选择范围；未调用模型。")
+        return {"sessionId": run["sessionId"], "text": message["content"], "refs": json.loads(message["meta"] or "{}").get("refs") or []}
+
+    def _rebuild_preview(self, run_id: str) -> dict[str, Any]:
+        original = self._original_task(run_id)
+        run = self.store.get_run(run_id)
+        old = run["scope"]
+        selected = old.get("selectedIds") or None
+        missing = []
+        if selected is not None:
+            # Only retain the original selection; never fall back to all matches.
+            members = None
+            if old.get("scenarioId"):
+                try:
+                    scenario = self.store.get_scenario(old["scenarioId"])
+                except ValueError as error:
+                    raise AppError("scope_scenario_missing", "原场景已删除，请调整场景；未调用模型。") from error
+                if scenario["batchId"] != old["batchId"]:
+                    raise AppError("scope_scenario_invalid", "原场景不属于原批次，请重新选择")
+                members = {item["id"] for item in scenario["requests"]}
+            kept_ids = set()
+            for offset in range(0, len(selected), 500):
+                page = self.domain.query(old["batchId"], {**old.get("filters", {}), "includeIds": selected[offset:offset+500], "limit": 500})
+                kept_ids.update(item["id"] for item in page["items"] if members is None or item["id"] in members)
+            missing = sorted(set(selected)-kept_ids)
+            selected = sorted(kept_ids)
+            if not selected:
+                raise AppError("scope_selection_missing", "原选择均已删除或不再匹配原条件；原问题仍保留，请重新选择请求。未创建任务、未调用模型。")
+        scope = self.domain.build_scope(old["batchId"], old.get("filters"), selected, old.get("scenarioId"))
+        before = {item["id"]: item["version"] for item in old.get("requestVersions", [])}
+        after = {item["id"]: item["version"] for item in scope["requestVersions"]}
+        refs = original["refs"]
+        kept = [ref for ref in refs if ref.get("id") in after]
+        added, removed = sorted(after.keys()-before.keys()), sorted(before.keys()-after.keys())
+        changed = sorted(key for key in before.keys() & after.keys() if before[key] != after[key])
+        return {"sessionId": run["sessionId"], "text": original["text"], "scope": scope, "refs": kept,
+                "diff": {"previousCount": len(before), "currentCount": len(after), "added": len(added), "removed": len(removed),
+                         "changed": len(changed), "excludedUnfinished": scope["excludedUnfinishedCount"],
+                         "keptRefs": len(kept), "removedRefs": len(refs)-len(kept),
+                         "missingSelected": len(missing), "missingSelectedIds": missing[:20],
+                         "samples": {"added": added[:20], "removed": removed[:20], "changed": changed[:20]}},
+                "notice": "复用原问题及仍在范围内的引用，保留原时间上界；需要新流量时请调整筛选范围后重新发送。"}
 
     def _load_settings(self) -> None:
+        try:
+            self.proxy.addon.timeout_settings = self.proxy.validate_timeouts(json.loads(self.store.get_setting("capture_timeouts") or "{}"))
+        except (ValueError, TypeError):
+            self.proxy.addon.timeout_settings = self.proxy.validate_timeouts({})
+            logging.warning("Invalid capture timeout policy; using defaults")
         self.throttle.update(False, 0, 0, 0)
         throttle_raw = self.store.get_setting("throttle")
         if throttle_raw:
@@ -84,7 +173,7 @@ class EngineApp:
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
         self.proxy.addon.decrypt_hosts.clear()
-        decrypt_raw = self.store.get_setting("decrypt_hosts", '["*"]')
+        decrypt_raw = self.store.get_setting("decrypt_hosts", '[]')
         try:
             for host in json.loads(decrypt_raw):
                 self.proxy.add_decrypt_host(str(host))
@@ -142,16 +231,16 @@ class EngineApp:
         }
 
     async def dispatch(self, method: str, params: dict[str, Any]) -> Any:
-        if method in ("agent.stop", "agent.approve", "agent.status"):
+        if method in ("agent.stop", "agent.approval", "agent.host-result", "agent.status", "compose.stop", "compose.status", "compose.list"):
             return await self._dispatch(method, params)
         async with self.mutation_lock:
             return await self._dispatch(method, params)
 
     async def _quiesce(self) -> None:
+        await self.agent.drain()
         self.proxy.set_paused(True)
         if self.proxy.running:
             await self.proxy.stop()
-        await self.agent.drain()
         await asyncio.to_thread(self.proxy.addon.flush_records)
         self.store.capture_generation += 1
 
@@ -167,6 +256,7 @@ class EngineApp:
             return self.projects
         directory = self.project_root if project_id == "default" else self.project_root / "projects" / project_id
         prepared = Store(directory)
+        prepared.recover_interrupted_requests()
         prepared.mark_interrupted_runs()
         prepared.recover_inflight_actions()
         await self._quiesce()
@@ -250,6 +340,10 @@ class EngineApp:
 
         if method == "capture.status":
             return self.proxy.status()
+        if method == "capture.timeouts.set":
+            result = self.proxy.set_timeouts(params.get("settings"))
+            emit("capture:status", result)
+            return result
         if method == "capture.start":
             port = int(params.get("port", self.proxy.port))
             self.store.set_setting("listen_port", str(port))
@@ -260,6 +354,29 @@ class EngineApp:
             return self.proxy.set_paused(bool(params.get("paused", True)))
         if method == "capture.set-lan":
             return await self.proxy.set_lan(bool(params.get("lan", False)))
+        if method == "connections.status":
+            status = self.proxy.status()
+            return {**self.proxy.connections.snapshot(), "listener": status,
+                    "certificate": self.certificate_info(), "checkedAt": now_ms()}
+        if method == "connections.pair":
+            if not self.proxy.running or not self.proxy.lan:
+                raise ValueError("请先开启局域网代理，再生成配对二维码")
+            return self.proxy.connections.start_pairing()
+        if method == "connections.invalidate":
+            self.proxy.connections.invalidate()
+            return {"ok": True}
+        if method == "connections.address":
+            from .proxy import get_network_addresses
+            address = str(params.get("address", ""))
+            if not any(item["address"] == address for item in get_network_addresses()):
+                raise ValueError("网络地址已失效，请刷新并选择当前网卡")
+            self.proxy.selected_ip = address
+            self.store.set_setting("lan_selected_ip", address)
+            self.proxy.connections.pairing = None
+            return self.proxy.status()
+        if method == "connections.grant":
+            self.proxy.connections.grant(str(params["address"]), str(params["action"]))
+            return self.proxy.connections.snapshot()
 
         if method in ("requests.list", "requests.query"):
             batch_id = params.get("batchId") or self.store.get_current_batch()["id"]
@@ -277,6 +394,8 @@ class EngineApp:
                 params.get("parent") or {"type": "root"},
                 int(params.get("limit", 500)),
             )
+        if method == "requests.locate":
+            return await asyncio.to_thread(self._locate_request, params)
         if method == "requests.detail":
             return await asyncio.to_thread(self._request_detail, params["requestId"])
         if method == "requests.content":
@@ -437,9 +556,9 @@ class EngineApp:
             return status
 
         if method == "sessions.list":
-            return self.store.list_sessions()
+            return await asyncio.to_thread(self.store.list_sessions)
         if method == "sessions.get":
-            return self.store.get_session(params["sessionId"])
+            return await asyncio.to_thread(self.store.get_session, params["sessionId"])
         if method == "sessions.create":
             return self.store.create_session(params.get("title", "新会话"))
         if method == "sessions.delete":
@@ -452,6 +571,21 @@ class EngineApp:
 
         if method == "providers.list":
             return self.store.list_providers()
+        if method == "providers.available":
+            import sqlite3
+            result = []
+            for project in self.projects["items"]:
+                if project["id"] == self.projects["active"]:
+                    continue
+                directory = self.project_root if project["id"] == "default" else self.project_root / "projects" / project["id"]
+                database = directory / "ai-proxy.sqlite3"
+                if not database.exists():
+                    continue
+                with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as db:
+                    db.row_factory = sqlite3.Row
+                    for row in db.execute("SELECT id,name,protocol,base_url,model FROM providers"):
+                        result.append({"id": row["id"], "name": row["name"], "protocol": row["protocol"], "baseUrl": row["base_url"], "model": row["model"], "projectName": project["name"]})
+            return result
         if method == "providers.save":
             provider = self.store.save_provider(params)
             emit("providers:changed", self.store.list_providers())
@@ -460,22 +594,44 @@ class EngineApp:
             self.store.delete_provider(params["providerId"])
             emit("providers:changed", self.store.list_providers())
             return {"ok": True}
-        if method == "providers.test":
+        if method in {"providers.test", "providers.capabilities"}:
             provider = next(
                 (item for item in self.store.list_providers() if item["id"] == params["providerId"]),
                 None,
             )
             if provider is None:
                 raise ValueError("供应商不存在")
-            model = _build_model(provider, str(params.get("apiKey", "")))
+            key = str(params.get("apiKey", ""))
+            model = _build_model(provider, key)
             agent = Agent(model, instructions="Reply with exactly OK, no other text.")
-            result = await asyncio.wait_for(
-                agent.run("Connection test. Reply with OK."),
-                timeout=45,
-            )
-            return {"ok": True, "output": str(result.output)[:100]}
+            prompt = "Connection test. Reply with OK."
+            if method == "providers.capabilities":
+                @agent.tool_plain
+                def connectivity_check() -> str:
+                    """Return a local synthetic connectivity marker; no business data or network action."""
+                    return "AI_PROXY_SYNTHETIC_OK"
+                prompt = "Call connectivity_check exactly once, then reply OK."
+            try:
+                from pydantic_ai.usage import UsageLimits
+                result = await asyncio.wait_for(agent.run(prompt, usage_limits=UsageLimits(request_limit=3, tool_calls_limit=1)), timeout=45)
+            except Exception as error:
+                raise ValueError(_provider_error(error, key)) from None
+            finally:
+                await model.client.close()
+            if method == "providers.capabilities":
+                from pydantic_ai.messages import ToolReturnPart
+                called = any(isinstance(part, ToolReturnPart) and part.tool_name == "connectivity_check" for message in result.all_messages() for part in message.parts)
+                if not called:
+                    raise ValueError("模型返回了文本但未调用合成工具。连接可用不代表 Agent 工具能力可用。")
+            return {"ok": True, "output": str(result.output)[:100], "toolsVerified": method == "providers.capabilities"}
 
         if method == "agent.send":
+            operation_id = str(params.get("operationId") or "")
+            operation_key = f"agent-submission:{params['sessionId']}:{operation_id}"
+            if operation_id and (saved := self.store.get_setting(operation_key)):
+                previous = json.loads(saved)
+                self.store.get_run(previous["runId"])
+                return previous
             scope = params.get("scope")
             if not scope:
                 batch_id = params.get("batchId") or self.store.get_current_batch()["id"]
@@ -488,7 +644,7 @@ class EngineApp:
                     params.get("scenarioId"),
                     "snapshot",
                 )
-            return await self.agent.start_run(
+            result = await self.agent.start_run(
                 session_id=params["sessionId"],
                 text=params["text"],
                 refs=params.get("refs", []),
@@ -500,11 +656,20 @@ class EngineApp:
                 budget={**DEFAULT_BUDGET, **(params.get("budget") or {})},
                 parent_run_id=params.get("parentRunId"),
             )
+            if operation_id:
+                self.store.set_setting(operation_key, json.dumps(result))
+            return result
         if method == "agent.continue":
             parent = self.store.get_run(params["runId"])
+            operation_id = str(params.get("operationId") or "")
+            operation_key = f"agent-submission:{parent['sessionId']}:{operation_id}"
+            if operation_id and (saved := self.store.get_setting(operation_key)):
+                previous = json.loads(saved)
+                self.store.get_run(previous["runId"])
+                return previous
             if parent["scope"].get("expired"):
                 raise ValueError("原分析范围已失效，请新建分析")
-            return await self.agent.start_run(
+            result = await self.agent.start_run(
                 session_id=parent["sessionId"],
                 text=params.get("text") or "继续上次未完成的分析，保留原有证据并先说明剩余待验证项。",
                 refs=[],
@@ -516,10 +681,35 @@ class EngineApp:
                 budget={**parent["budget"], **(params.get("budget") or {})},
                 parent_run_id=parent["id"],
             )
+            if operation_id:
+                self.store.set_setting(operation_key, json.dumps(result))
+            return result
         if method == "agent.stop":
             return self.agent.stop()
         if method == "agent.status":
             return self.agent.status()
+        if method == "agent.cache-status":
+            return self.agent.cache_status()
+        if method == "agent.cache-clear":
+            return self.agent.clear_cache()
+        if method == "agent.performance-compare":
+            return await asyncio.to_thread(compare_performance, self.store, params.get("runIds"))
+        if method == "agent.rebuild-preview":
+            return await asyncio.to_thread(self._rebuild_preview, params["runId"])
+        if method == "agent.original-task":
+            return await asyncio.to_thread(self._original_task, params["runId"])
+        if method == "agent.context.identity":
+            return await asyncio.to_thread(self.agent.input_identity, params["sessionId"], str(params.get("providerId", "")))
+        if method == "agent.context":
+            return await asyncio.to_thread(self.agent.context_status, params["sessionId"], str(params.get("providerId", "")))
+        if method == "agent.context.preview":
+            return await asyncio.to_thread(self.agent.input_preview, params)
+        if method == "agent.context.model.set":
+            return self.agent.set_model_window(params)
+        if method == "agent.context.set":
+            return self.agent.set_context_settings(params.get("settings") or {})
+        if method == "agent.compress":
+            return await asyncio.to_thread(self.agent.compress_context, params["sessionId"])
         if method == "agent.budget":
             return self.agent.default_budget()
         if method == "agent.budget.set":
@@ -530,25 +720,29 @@ class EngineApp:
         if method == "agent.host-result":
             self.agent.resolve_host_result(params["requestId"], params)
             return {"ok": True}
+        if method == "agent.history":
+            return await asyncio.to_thread(self.store.run_history, params["sessionId"], int(params.get("offset", 0)), int(params.get("limit", 12)))
         if method == "agent.runs":
-            return self.store.list_runs(params["sessionId"])
+            return await asyncio.to_thread(self.store.list_runs, params["sessionId"])
         if method == "agent.run":
-            return self.store.get_run(params["runId"])
+            return await asyncio.to_thread(self.store.get_run, params["runId"])
         if method == "agent.events":
-            return self.store.list_events(
+            return await asyncio.to_thread(self.store.list_events,
                 params["runId"],
                 int(params.get("afterSeq", 0)),
                 int(params.get("limit", 500)),
             )
         if method == "agent.evidence":
-            return self.store.list_evidence(params["runId"])
+            return await asyncio.to_thread(self.store.list_evidence, params["runId"])
         if method == "evidence.get":
             return self.store.get_evidence(params["evidenceId"])
 
+        if method == "reports.history":
+            return await asyncio.to_thread(self.store.report_history, params["sessionId"], int(params.get("offset", 0)), int(params.get("limit", 8)))
         if method == "reports.list":
-            return self.store.list_reports(params.get("sessionId"))
+            return await asyncio.to_thread(self.store.list_reports, params.get("sessionId"))
         if method == "reports.get":
-            return self.store.get_report(params["reportId"])
+            return await asyncio.to_thread(self.store.get_report, params["reportId"])
         if method == "reports.save":
             report = self.store.save_report(params)
             emit("report:created", {"report": report})
@@ -728,6 +922,19 @@ class EngineApp:
                 params["traceId"],
             )
 
+        if method == "compose.preview":
+            return await asyncio.to_thread(self.agent.composer.preview, params)
+        if method == "compose.start":
+            return self.agent.composer.start(params["jobId"])
+        if method == "compose.status":
+            async with self.compose_reads:
+                return await asyncio.to_thread(self.agent.composer.get, params["jobId"])
+        if method == "compose.stop":
+            return self.agent.composer.stop(params["jobId"])
+        if method == "compose.list":
+            async with self.compose_reads:
+                return await asyncio.to_thread(self.agent.composer.list_jobs, int(params.get("offset", 0)), int(params.get("limit", 20)))
+
         if method == "replay.preview":
             return await asyncio.to_thread(
                 self.domain.replay,
@@ -779,7 +986,19 @@ class EngineApp:
         if method == "certificate.info":
             return self.certificate_info()
         if method == "storage.info":
-            return self.store.storage_info()
+            return await asyncio.to_thread(self.store.storage_info)
+        if method == "storage.health":
+            store, addon = self.store, self.proxy.addon
+            if self.storage_health_task and not self.storage_health_task.done():
+                raise ValueError("上次存储检查仍在等待磁盘响应，请先恢复磁盘，不要连续提交检查")
+            self.storage_health_task = asyncio.create_task(asyncio.to_thread(storage_health, store))
+            self.storage_health_task.add_done_callback(lambda task: task.exception() if not task.cancelled() else None)
+            result = await asyncio.shield(self.storage_health_task)
+            return {**result, "capture": {"lastPersistedAt": addon.last_persisted_at,
+                    "lastFailure": addon.last_persist_error, "failedWrites": addon.failed_writes,
+                    "queueDrops": addon.queue_drops, "recordLossEvents": addon.capture_loss,
+                    "queueDepth": addon.record_queue.qsize(), "queueLimit": addon.record_queue.maxsize},
+                    "notice": "最近保存时间与失败次数仅统计本次项目打开后的采集；不包含请求正文或凭据。"}
         if method == "storage.clear-all":
             await self._quiesce()
             local_state = {"projectId": self.projects["active"], "batchIds": [item["id"] for item in self.store.list_batches()], "sessionIds": [item["id"] for item in self.store.list_sessions()], "reportIds": [item["id"] for item in self.store.list_reports()]}
@@ -843,7 +1062,7 @@ class EngineApp:
                 "## 数据缺口与边界",
                 "",
                 "- 手机代理只观察经过本应用的流量；服务内部 Span 需要导入后才会出现。",
-                f"- 未完成请求：{scope.get('unfinishedCount', 0)}。",
+                f"- 快照内未完成请求：{scope.get('unfinishedCount', 0)}；创建时明确排除的进行中请求：{scope.get('excludedUnfinishedCount', 0)}。",
                 "- 正文缺失、流式未保存或采集截断会在对应证据中标记。",
                 "",
                 "## 复现与验证",
@@ -912,11 +1131,15 @@ class EngineApp:
 
     def certificate_info(self) -> dict[str, Any]:
         cert = self.proxy.cert_dir / "mitmproxy-ca-cert.pem"
+        import hashlib
+        import ssl
+        fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest() if cert.exists() else None
         return {
             "path": str(cert),
             "exists": cert.exists(),
             "url": "http://mitm.it/",
             "directory": str(self.proxy.cert_dir),
+            "fingerprint": fingerprint,
         }
 
     def _request_detail(self, request_id: str) -> dict[str, Any]:
@@ -961,22 +1184,38 @@ async def read_requests(app: EngineApp) -> None:
         params = payload.get("params") or {}
 
         async def handle(req_id: Any = request_id, name: str = method, args: dict[str, Any] = params):
+            read_only = (name.startswith("requests.") and name != "requests.add-relation") or name in ("agent.original-task", "agent.context.identity", "reports.history", "compose.status", "compose.list", "agent.history", "agent.rebuild-preview", "agent.context.preview", "agent.context", "storage.health", "agent.performance-compare", "agent.evidence", "agent.runs", "agent.run", "agent.events", "agent.status", "sessions.get", "sessions.list", "reports.get", "reports.list")
+            cancel_event = threading.Event() if read_only else None
+            token = CANCEL_EVENT.set(cancel_event)
             try:
-                result = await app.dispatch(name, args)
+                if read_only:
+                    async with asyncio.timeout(20):
+                        result = await app.dispatch(name, args)
+                else:
+                    result = await app.dispatch(name, args)
                 response = {"type": "response", "id": req_id, "ok": True, "result": result}
+            except TimeoutError:
+                if cancel_event:
+                    cancel_event.set()
+                message = "读取超时（20 秒），请缩小范围或重试" if read_only else "操作等待超时，回执未知；请先核对操作历史与实际结果，不要直接重复执行"
+                response = {"type": "response", "id": req_id, "ok": False, "error": message, "errorCode": "timeout"}
             except Exception as error:
-                logging.exception("RPC %s failed", name)
+                logging.error("RPC %s failed (%s)", name, type(error).__name__)
                 response = {
                     "type": "response",
                     "id": req_id,
                     "ok": False,
                     "error": str(error),
+                    "errorCode": error_code(error),
                 }
+            finally:
+                CANCEL_EVENT.reset(token)
             with _stdout_lock:
                 sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
                 sys.stdout.flush()
 
         asyncio.create_task(handle(), name=f"rpc-{method}")
+    await app.agent.drain()
     await app.proxy.stop()
 
 

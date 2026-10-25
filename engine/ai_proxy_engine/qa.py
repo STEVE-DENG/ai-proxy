@@ -33,7 +33,7 @@ class QAService:
 
     def catalog(self) -> dict[str, Any]:
         batch_id = self.store.get_current_batch()["id"]
-        return {"items": [item for item in self.store.list_configs() if item["kind"].startswith("qa_")], "scenarios": self.store.list_scenarios(batch_id), "reports": self.store.list_reports(), "sessions": self.store.list_sessions(), "streamCapture": self.store.get_setting("capture_stream_events", "false") == "true", "projectId": self.store.data_dir.name, "websocketCapture": self.store.get_setting("capture_websocket_frames", "false") == "true"}
+        return {"items": [item for item in self.store.list_configs() if item["kind"].startswith("qa_")], "scenarios": self.store.list_scenarios(batch_id), "reports": self.store.report_summaries(), "sessions": self.store.list_sessions(), "streamCapture": self.store.get_setting("capture_stream_events", "false") == "true", "projectId": self.store.data_dir.name, "websocketCapture": self.store.get_setting("capture_websocket_frames", "false") == "true"}
 
     def field_value(self, request_id: str, selector: dict[str, Any]) -> Any:
         detail = self.store.request_detail(request_id)

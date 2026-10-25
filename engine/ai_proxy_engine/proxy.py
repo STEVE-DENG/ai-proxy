@@ -27,6 +27,7 @@ from .domain import parse_trace_context
 from .rules import apply_map_local, apply_map_remote, apply_rewrite, first_rule
 from .store import Store, new_id, now_ms
 from .throttle import Throttle
+from .connections import Connections
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +49,33 @@ class ProxyAddon:
         self.request_count = 0
         self.sequence = 0
         self.capture_loss = 0
+        self.failed_writes = 0
+        self.queue_drops = 0
         self.last_record_loss_reason: str | None = None
+        self.last_persisted_at: int | None = None
+        self.last_persist_error: dict[str, Any] | None = None
+        self.timeout_settings = {"requestTimeoutSeconds": 120, "streamIdleTimeoutSeconds": 120, "http2Enabled": True}
         self.last_tls_error: str | None = None
+        self.connections: Connections | None = None
+        self.active_flows: dict[str, http.HTTPFlow] = {}
+        self.client_writers: dict[int, asyncio.StreamWriter] = {}
+        self.client_activity: dict[int, float] = {}
+        self._snapshot_key: tuple | None = None
+        self._config_snapshot: dict[str, Any] = {}
+        self._environment_snapshot: dict[str, Any] = {}
+        self.persist_outcomes: dict[str, str] = {}
+        self.compose_tokens: dict[str, dict[str, Any]] = {}
         self.record_queue: Queue[dict[str, Any] | None] = Queue(maxsize=1000)
         self.record_thread = __import__("threading").Thread(
             target=self._record_worker, name="capture-record-writer", daemon=True
         )
         self.record_thread.start()
+
+    def _persist_outcome(self, request_id: str, state: str) -> None:
+        # Bounded metadata; no captured content. Older missing rows remain unknown.
+        self.persist_outcomes[request_id] = state
+        if len(self.persist_outcomes) > 1000:
+            self.persist_outcomes.pop(next(iter(self.persist_outcomes)), None)
 
     def _record_worker(self) -> None:
         while True:
@@ -64,14 +85,22 @@ class ProxyAddon:
                 return
             try:
                 summary = self.store.save_request(item)
+                if item.get("request_state") != "in_progress":
+                    self._persist_outcome(item["id"], "saved")
+                self.last_persisted_at = now_ms()
                 self.emit("capture:request", summary)
-            except Exception:
+            except Exception as error:
                 logger.exception("Failed to persist captured request")
                 self.capture_loss += 1
+                if item.get("request_state") != "in_progress":
+                    self._persist_outcome(item["id"], "failed")
+                self.failed_writes += 1
                 self.last_record_loss_reason = "persist-failed"
+                self.last_persist_error = {"at": now_ms(), "code": type(error).__name__}
                 self.emit(
                     "capture:record-loss",
-                    {"reason": "persist-failed", "total": self.capture_loss},
+                    {"reason": "persist-failed", "total": self.capture_loss, "requestId": item.get("id"),
+                     "final": item.get("request_state") != "in_progress", "errorType": type(error).__name__},
                 )
             finally:
                 self.record_queue.task_done()
@@ -87,6 +116,51 @@ class ProxyAddon:
 
     def refresh_rules(self) -> None:
         self.rules = self.store.list_rules()
+
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
+        if flow.request.host.lower() == "ai-proxy.test" or flow.request.method == "CONNECT":
+            return
+        self._prepare_flow(flow)
+        flow.metadata["ai_proxy_activity"] = time.monotonic()
+        policy = dict(self.timeout_settings)
+        flow.metadata["ai_proxy_timeout_settings"] = policy
+        flow.metadata["ai_proxy_deadline"] = time.monotonic() + policy["requestTimeoutSeconds"]
+        self.active_flows[flow.id] = flow
+        self._record(flow, final=False)
+
+    def interrupt(self, flow: http.HTTPFlow, message: str) -> None:
+        flow.metadata["ai_proxy_error"] = message
+        flow.metadata["ai_proxy_recorded_final"] = False
+        peer = flow.client_conn.peername
+        writer = self.client_writers.get(peer[1]) if peer else None
+        if writer:
+            writer.close()
+        if flow.killable:
+            flow.kill()
+        self._record(flow, final=True)
+        self.active_flows.pop(flow.id, None)
+
+    async def watch_timeouts(self) -> None:
+        while True:
+            await asyncio.sleep(1)
+            if self.connections:
+                self.connections.check_lifecycle()
+            stamp = time.monotonic()
+            for flow in list(self.active_flows.values()):
+                streaming = bool(flow.metadata.get("ai_proxy_streamed") or flow.websocket)
+                activity = flow.metadata.get("ai_proxy_activity", stamp)
+                if flow.websocket and flow.client_conn.peername:
+                    activity = self.client_activity.get(flow.client_conn.peername[1], activity)
+                policy = flow.metadata.get("ai_proxy_timeout_settings", self.timeout_settings)
+                seconds = policy["streamIdleTimeoutSeconds"] if streaming else policy["requestTimeoutSeconds"]
+                deadline = activity + seconds if streaming else flow.metadata.get("ai_proxy_deadline", stamp + seconds)
+                if stamp >= deadline:
+                    shared = "；关闭承载连接，HTTP/2并行请求可能同时中断" if flow.request.http_version == "HTTP/2.0" else ""
+                    self.interrupt(flow, (f"请求超时：流连接连续 {seconds} 秒无数据" if streaming else f"请求超时：{seconds} 秒内未完成响应") + shared)
+
+    def interrupt_all(self) -> None:
+        for flow in list(self.active_flows.values()):
+            self.interrupt(flow, "采集已停止，连接中断")
 
     def add_decrypt_host(self, host: str) -> None:
         self.decrypt_hosts.add(host.lower().lstrip("."))
@@ -111,6 +185,9 @@ class ProxyAddon:
 
     def tls_clienthello(self, data) -> None:
         host = (data.client_hello.sni or "").lower()
+        if host == "ai-proxy.test" and self._should_decrypt(host):
+            # The local challenge has no upstream server or public DNS record.
+            data.establish_server_tls_first = False
         if not self._should_decrypt(host):
             data.ignore_connection = True
 
@@ -125,16 +202,31 @@ class ProxyAddon:
         flow.metadata["ai_proxy_generation"] = self.store.capture_generation
         flow.metadata["ai_proxy_started"] = now_ms()
         flow.metadata["ai_proxy_batch"] = batch["id"]
+        compose_token = request.headers.pop("X-AI-Proxy-Compose-Action", None)
+        compose = self.compose_tokens.pop(compose_token, None) if compose_token else None
+        if compose:
+            flow.metadata["ai_proxy_compose"] = {key: value for key, value in compose.items() if key != "capturedRequestId"}
+            flow.metadata["ai_proxy_batch"] = compose["batchId"]
+            compose["capturedRequestId"] = flow.metadata["ai_proxy_id"]
         flow.metadata["ai_proxy_start_sequence"] = self.sequence
         peer = flow.client_conn.peername
         flow.metadata["ai_proxy_peer"] = f"{peer[0]}:{peer[1]}" if peer else ""
         flow.metadata["ai_proxy_connection"] = str(
             getattr(flow.client_conn, "id", None) or f"{peer[0]}:{peer[1]}" if peer else new_id("conn")
         )
-        flow.metadata["ai_proxy_config_snapshot"] = {"configVersion": self.store.config_version(), "configHash": self.store.config_hash(), "rules": self.rules, "throttle": self.throttle.status(), "businessRules": self.store.list_configs("business_rule"), "environmentId": self.store.get_setting("active_environment")}
+        version = self.store.config_version()
         environment_id = self.store.get_setting("active_environment")
-        environment_item = next((item for item in self.store.list_configs("environment") if item["id"] == environment_id), None)
-        flow.metadata["ai_proxy_environment"] = ({**environment_item["config"], "name": environment_item["name"]} if environment_item else {})
+        throttle = self.throttle.status()
+        snapshot_key = (version, environment_id, json.dumps(throttle, sort_keys=True))
+        if snapshot_key != self._snapshot_key:
+            self._config_snapshot = {"configVersion": version, "configHash": self.store.config_hash(), "rules": self.rules, "throttle": throttle, "businessRules": self.store.list_configs("business_rule"), "environmentId": environment_id}
+            environment_item = next((item for item in self.store.list_configs("environment") if item["id"] == environment_id), None)
+            self._environment_snapshot = ({**environment_item["config"], "name": environment_item["name"]} if environment_item else {})
+            self._snapshot_key = snapshot_key
+        flow.metadata["ai_proxy_config_snapshot"] = self._config_snapshot
+        flow.metadata["ai_proxy_environment"] = self._environment_snapshot
+        flow.metadata["ai_proxy_capture_sse"] = self.store.get_setting("capture_stream_events", "false") == "true"
+        flow.metadata["ai_proxy_capture_websocket"] = self.store.get_setting("capture_websocket_frames", "false") == "true"
         flow.metadata["ai_proxy_request_body_before"] = _body_fingerprint(request)
         flow.metadata["ai_proxy_request_headers_original"] = list(request.headers.items(multi=True))
         if request.method == "CONNECT":
@@ -153,7 +245,17 @@ class ProxyAddon:
         self._record(flow, final=True)
 
     async def request(self, flow: http.HTTPFlow) -> None:
+        if flow.request.host.lower() == "ai-proxy.test":
+            flow.metadata["ai_proxy_diagnostic"] = True
+            local = flow.client_conn.peername
+            address = self.client_ports.get(local[1], "127.0.0.1") if local else "127.0.0.1"
+            layer = "https" if flow.request.scheme == "https" else "http"
+            ok = bool(self.connections and self.connections.evidence(layer, flow.request.pretty_url, address))
+            body = "验证成功。请返回 Mac 查看对应层级结果。" if ok else "验证已过期或设备不匹配。请在 Mac 重新生成配对二维码。"
+            flow.response = http.Response.make(200 if ok else 410, ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><p>" + body).encode(), {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"})
+            return
         self._prepare_flow(flow)
+        flow.metadata["ai_proxy_request_body_before"] = _body_fingerprint(flow.request)
         host = (flow.request.host or "").lower()
         rules = flow.metadata["ai_proxy_config_snapshot"]["rules"]
         throttle = flow.metadata["ai_proxy_config_snapshot"]["throttle"]
@@ -197,6 +299,7 @@ class ProxyAddon:
         if not flow.response:
             return
         flow.metadata["ai_proxy_response_headers"] = now_ms()
+        flow.metadata["ai_proxy_activity"] = time.monotonic()
         # This hook runs before the response rewrite hook. Keep an immutable
         # copy so rule evidence can show the actual upstream Header.
         flow.metadata["ai_proxy_response_headers_original"] = list(
@@ -215,7 +318,12 @@ class ProxyAddon:
         if "text/event-stream" in content_type or too_large:
             flow.response.stream = True
             flow.metadata["ai_proxy_streamed"] = True
-            if "text/event-stream" in content_type and self.store.get_setting("capture_stream_events", "false") == "true":
+            def observe_chunk(chunk: bytes) -> bytes:
+                if chunk:
+                    flow.metadata["ai_proxy_activity"] = time.monotonic()
+                return chunk
+            flow.response.stream = observe_chunk
+            if "text/event-stream" in content_type and flow.metadata.get("ai_proxy_capture_sse"):
                 state = {"events": [], "bytesObserved": 0, "bytesSaved": 0, "limited": False, "complete": False, "startedAt": now_ms()}
                 flow.metadata["ai_proxy_sse"] = state
                 decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -223,6 +331,8 @@ class ProxyAddon:
                 previous_at = None
                 def stream_chunk(chunk: bytes) -> bytes:
                     nonlocal pending, previous_at
+                    if chunk:
+                        flow.metadata["ai_proxy_activity"] = time.monotonic()
                     state["bytesObserved"] += len(chunk)
                     if state["bytesSaved"] + len(chunk) <= 256 * 1024 and len(state["events"]) < 500:
                         state["bytesSaved"] += len(chunk)
@@ -248,6 +358,8 @@ class ProxyAddon:
                 flow.response.stream = stream_chunk
 
     def response(self, flow: http.HTTPFlow) -> None:
+        if flow.metadata.get("ai_proxy_diagnostic"):
+            return
         if not flow.response:
             return
         flow.metadata["ai_proxy_response_body_before"] = _body_fingerprint(flow.response)
@@ -266,9 +378,11 @@ class ProxyAddon:
         self._record(flow, final=True)
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
-        if not flow.websocket or self.store.get_setting("capture_websocket_frames", "false") != "true":
+        flow.metadata["ai_proxy_activity"] = time.monotonic()
+        if not flow.websocket or not flow.metadata.get("ai_proxy_capture_websocket"):
             return
         state = flow.metadata.setdefault("ai_proxy_websocket", {"frames": [], "bytesObserved": 0, "bytesSaved": 0, "limited": False, "startedAt": now_ms()})
+        was_limited = state["limited"]
         message = flow.websocket.messages[-1]
         data = message.content
         state["bytesObserved"] += len(data)
@@ -277,10 +391,15 @@ class ProxyAddon:
             state["frames"].append({"direction": "request" if message.from_client else "response", "time": int(message.timestamp * 1000), "opcode": int(message.type), "size": len(data), "text": data.decode("utf-8", "replace") if int(message.type) == 1 else None, "sha256": hashlib.sha256(data).hexdigest(), "binary": int(message.type) != 1})
         else:
             state["limited"] = True
+        stamp = time.monotonic()
+        if stamp - flow.metadata.get("ai_proxy_ws_checkpoint", 0) < 1 and was_limited == state["limited"]:
+            return
+        flow.metadata["ai_proxy_ws_checkpoint"] = stamp
         flow.metadata["ai_proxy_recorded_final"] = False
         self._record(flow, final=True)
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
+        self.active_flows.pop(flow.id, None)
         state = flow.metadata.get("ai_proxy_websocket")
         if state is not None and flow.websocket:
             state.update(endedAt=now_ms(), closeCode=flow.websocket.close_code, closeReason=flow.websocket.close_reason, complete=not state["limited"])
@@ -289,7 +408,7 @@ class ProxyAddon:
 
     def error(self, flow: http.HTTPFlow) -> None:
         if flow.error:
-            flow.metadata["ai_proxy_error"] = f"{flow.error.msg}: {flow.error.detail or ''}".strip()
+            flow.metadata.setdefault("ai_proxy_error", flow.error.msg)
             if "tls" in flow.metadata["ai_proxy_error"].lower() or "certificate" in flow.metadata["ai_proxy_error"].lower():
                 self.last_tls_error = flow.metadata["ai_proxy_error"]
                 flow.metadata["ai_proxy_tls_error"] = self.last_tls_error
@@ -305,6 +424,10 @@ class ProxyAddon:
         self._record(flow, final=True)
 
     def _record(self, flow: http.HTTPFlow, *, final: bool) -> None:
+        if flow.metadata.get("ai_proxy_diagnostic"):
+            return
+        if final and (not flow.websocket or flow.error):
+            self.active_flows.pop(flow.id, None)
         progress_recorded = bool(flow.metadata.get("ai_proxy_recorded_progress"))
         if final and flow.metadata.get("ai_proxy_recorded_final"):
             return
@@ -357,13 +480,14 @@ class ProxyAddon:
             original_response_headers = current_response_headers
             flow.metadata["ai_proxy_response_headers_original"] = current_response_headers
         rule_evidence = {
+            "compose": flow.metadata.get("ai_proxy_compose"),
             "configSnapshot": flow.metadata.get("ai_proxy_config_snapshot"),
             "configAtCompletion": self.store.config_version(),
             "throttleBoundary": "配置记录于请求开始；传输带宽预算跟随运行时设置，期间的改动不代表整个请求均使用同一限速",
             "requestBodyChange": {"before": flow.metadata.get("ai_proxy_request_body_before"), "after": _body_fingerprint(request)},
             "responseBodyChange": {"before": flow.metadata.get("ai_proxy_response_body_before"), "after": _body_fingerprint(response) if response else None},
-            "streamEvents": flow.metadata.get("ai_proxy_sse"),
-            "websocket": flow.metadata.get("ai_proxy_websocket"),
+            "streamEvents": _stream_snapshot(flow.metadata.get("ai_proxy_sse"), "events"),
+            "websocket": _stream_snapshot(flow.metadata.get("ai_proxy_websocket"), "frames"),
             "matchedRule": flow.metadata.get("ai_proxy_matched_rule"),
             "rewrites": flow.metadata.get("ai_proxy_rewrites") or [],
             "requestHeaderChanges": _header_changes(original_request_headers, current_request_headers),
@@ -384,7 +508,7 @@ class ProxyAddon:
             request_state = "completed"
             request_body_state = "connect-tunnel"
             response_body_state = "connect-tunnel"
-        elif final and streamed:
+        elif final and streamed and not flow.metadata.get("ai_proxy_error"):
             request_state = "completed"
             response_body_state = (
                 "capture-truncated"
@@ -472,12 +596,22 @@ class ProxyAddon:
         try:
             self.record_queue.put_nowait(payload)
         except Full:
+            if payload.get("request_state") != "in_progress":
+                self._persist_outcome(request_id, "failed")
+            self.queue_drops += 1
             self.last_record_loss_reason = "queue-full"
             self.capture_loss += 1
             self.emit(
                 "capture:record-loss",
                 {"reason": "queue-full", "total": self.capture_loss, "requestId": request_id},
             )
+
+
+def _stream_snapshot(state: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    # The writer thread must not observe frames added after this checkpoint.
+    return {**state, key: [dict(item) for item in state.get(key, [])]}
 
 
 def _content_or_none(message: Any) -> tuple[bytes | None, bool]:
@@ -506,16 +640,53 @@ class ProxyManager:
         self.addon = ProxyAddon(store, throttle, emit)
         self.master: dump.DumpMaster | None = None
         self.master_task: asyncio.Task | None = None
+        self.timeout_task: asyncio.Task | None = None
         self.server: asyncio.AbstractServer | None = None
         self.cert_server: asyncio.AbstractServer | None = None
         self.cert_port = 0
         self.port = 8080
         self.lan = False
         self.internal_port = 0
+        self.listener_id = new_id("listener")
         self.running = False
         self.paused = False
         self.started_at: int | None = None
         self._server_lock = asyncio.Lock()
+        self.connections = Connections(store)
+        self.addon.connections = self.connections
+        self.selected_ip = store.get_setting("lan_selected_ip")
+        self._network_signature: tuple | None = None
+        try:
+            self.addon.timeout_settings = self.validate_timeouts(json.loads(store.get_setting("capture_timeouts") or "{}"))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            logger.warning("Invalid saved capture timeout policy; using defaults")
+
+    @staticmethod
+    def validate_timeouts(data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("超时配置必须是对象")
+        policy = {"requestTimeoutSeconds": 120, "streamIdleTimeoutSeconds": 120, "http2Enabled": True}
+        for key in ("requestTimeoutSeconds", "streamIdleTimeoutSeconds"):
+            value = data.get(key, policy[key])
+            if isinstance(value, bool) or not isinstance(value, int) or not 5 <= value <= 3600:
+                raise ValueError("请求总时限与流空闲时限必须是5–3600秒的整数")
+            policy[key] = value
+        if not isinstance(data.get("http2Enabled", True), bool):
+            raise ValueError("HTTP/2开关必须是布尔值")
+        policy["http2Enabled"] = data.get("http2Enabled", True)
+        return policy
+
+    def set_timeouts(self, data: dict[str, Any]) -> dict[str, Any]:
+        policy = self.validate_timeouts(data)
+        if self.running and policy["http2Enabled"] != self.addon.timeout_settings["http2Enabled"]:
+            raise ValueError("请先停止代理，再修改HTTP/2开关")
+        self.store.set_setting("capture_timeouts", json.dumps(policy))
+        self.addon.timeout_settings = policy
+        if self.master:
+            # A transport idle guard must not pre-empt any existing flow's policy.
+            active = [p.metadata.get("ai_proxy_timeout_settings", policy) for p in self.addon.active_flows.values()]
+            self.master.options.tcp_timeout = max(value[k] for value in [policy, *active] for k in ("requestTimeoutSeconds", "streamIdleTimeoutSeconds"))
+        return self.status()
 
     @staticmethod
     def _free_port() -> int:
@@ -527,6 +698,7 @@ class ProxyManager:
         if self.running:
             return self.status()
         self.paused = False
+        self.listener_id = new_id("listener")
         self.addon.recording = True
         self.port = int(port)
         self.lan = bool(lan)
@@ -536,7 +708,7 @@ class ProxyManager:
             listen_port=self.internal_port,
             confdir=str(self.cert_dir),
             mode=["regular"],
-            http2=True,
+            http2=self.addon.timeout_settings["http2Enabled"],
         )
         try:
             self.master = dump.DumpMaster(
@@ -548,6 +720,7 @@ class ProxyManager:
             # These options are registered by default addons during DumpMaster construction.
             opts.connection_strategy = "lazy"
             opts.stream_large_bodies = "5m"
+            opts.tcp_timeout = max(self.addon.timeout_settings["requestTimeoutSeconds"], self.addon.timeout_settings["streamIdleTimeoutSeconds"])
             self.master.addons.add(self.addon)
             self.master_task = asyncio.create_task(self.master.run(), name="mitmproxy")
             await asyncio.sleep(0.25)
@@ -560,6 +733,7 @@ class ProxyManager:
             await self.stop()
             raise
         self.running = True
+        self.timeout_task = asyncio.create_task(self.addon.watch_timeouts(), name="capture-timeouts")
         self.started_at = now_ms()
         self.emit("capture:status", self.status())
         return self.status()
@@ -600,6 +774,10 @@ class ProxyManager:
                 else "/"
             )
             path = urlsplit(target).path
+            peer = writer.get_extra_info("peername")
+            address = peer[0] if peer else "127.0.0.1"
+            paired = path == "/" and self.connections.evidence("direct", target, address)
+            token = self.connections.token_from(target) if paired else ""
             cert_path = self.cert_dir / "mitmproxy-ca-cert.pem"
             cert_pem = cert_path.read_bytes() if cert_path.exists() else b""
             cert_der = (
@@ -639,6 +817,9 @@ class ProxyManager:
 <style>body{{font:16px/1.65 -apple-system,BlinkMacSystemFont,sans-serif;max-width:38rem;margin:7vh auto;padding:0 22px;color:#17231e;background:#eee9dd}}h1{{font-size:30px;margin-bottom:6px}}h2{{font-size:17px;margin:26px 0 8px}}p,li{{color:#4e544f}}a{{display:inline-block;background:#315e4a;color:#fff;padding:11px 16px;border-radius:8px;text-decoration:none;margin:5px 5px 5px 0}}a.secondary{{background:#fff;color:#315e4a;border:1px solid #b9c7bd}}code{{background:#fff;padding:3px 6px;border-radius:4px}}.proxy{{padding:14px;background:#e2ddd0;border-radius:9px}}.note{{border-top:1px solid #ccc;margin-top:26px;padding-top:16px;color:#6f695e;font-size:14px}}</style>
 <h1>AI Proxy 手机 HTTPS</h1><p>只在你信任的 Wi-Fi 下使用。抓包内容可能包含账号和隐私数据。</p>
 <div class="proxy"><b>Wi-Fi 手动代理</b><br>服务器：<code>{html.escape(proxy_host)}</code>　端口：<code>{self.port}</code></div>
+<h2>先验证 HTTP</h2><p>先设置手机 Wi-Fi 手动代理，再在 Mac 允许该地址访问。</p>
+<p><a href="http://ai-proxy.test/?pair={html.escape(token)}">验证 HTTP 代理路径</a><a href="https://ai-proxy.test/?pair={html.escape(token)}">安装信任后验证 HTTPS</a></p>
+<p>配对有时效。验证成功只说明当前浏览器该次请求经过代理，不代表目标 App 已连接。</p>
 <h2>1. 安装根证书</h2>
 <p><a href="/ai-proxy.mobileconfig">iPhone / iPad 安装描述文件</a><a class="secondary" href="/ca.crt">Android 下载 CA 证书</a></p>
 <p><b>iOS / iPadOS</b>：安装后进入「设置 → 通用 → 关于本机 → 证书信任设置」，打开 AI Proxy 根证书的完全信任。</p>
@@ -704,19 +885,30 @@ class ProxyManager:
         try:
             peer = writer.get_extra_info("peername")
             client_ip = peer[0] if peer else "127.0.0.1"
-            upstream_reader, upstream_writer = await asyncio.open_connection(
-                "127.0.0.1", self.internal_port
+            if not self.connections.allowed(client_ip):
+                writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                self.emit("connections:changed", self.connections.snapshot())
+                return
+            self.connections.writers.setdefault(client_ip, set()).add(writer)
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", self.internal_port), timeout=10
             )
             sockname = upstream_writer.get_extra_info("sockname")
             if sockname:
                 upstream_port = sockname[1]
                 self.addon.client_ports[upstream_port] = client_ip
+                self.addon.client_writers[upstream_port] = writer
+                self.addon.client_activity[upstream_port] = time.monotonic()
+            def activity() -> None:
+                if upstream_port is not None:
+                    self.addon.client_activity[upstream_port] = time.monotonic()
             tasks = [
                 asyncio.create_task(
-                    self._pipe(reader, upstream_writer, self.throttle.up)
+                    self._pipe(reader, upstream_writer, self.throttle.up, activity)
                 ),
                 asyncio.create_task(
-                    self._pipe(upstream_reader, writer, self.throttle.down)
+                    self._pipe(upstream_reader, writer, self.throttle.down, activity)
                 ),
             ]
             try:
@@ -725,11 +917,15 @@ class ProxyManager:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-        except (ConnectionError, OSError) as error:
+        except (ConnectionError, OSError, TimeoutError) as error:
             logger.debug("Forwarding connection closed: %s", error)
         finally:
+            if 'client_ip' in locals():
+                self.connections.writers.get(client_ip, set()).discard(writer)
             if upstream_port is not None:
                 self.addon.client_ports.pop(upstream_port, None)
+                self.addon.client_writers.pop(upstream_port, None)
+                self.addon.client_activity.pop(upstream_port, None)
             if upstream_writer:
                 upstream_writer.close()
                 with contextlib.suppress(Exception):
@@ -743,13 +939,15 @@ class ProxyManager:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         gate,
+        activity: Callable[[], None],
     ) -> None:
         try:
             while data := await reader.read(16 * 1024):
+                activity()
                 await gate.consume(len(data))
                 writer.write(data)
                 await writer.drain()
-        except (ConnectionError, OSError):
+        except (ConnectionError, OSError, TimeoutError):
             pass
         finally:
             with contextlib.suppress(Exception):
@@ -757,6 +955,7 @@ class ProxyManager:
 
     async def set_lan(self, lan: bool) -> dict[str, Any]:
         self.lan = bool(lan)
+        self.connections.reset()
         if self.running:
             await self._start_server()
             await self._start_cert_server()
@@ -764,12 +963,18 @@ class ProxyManager:
         return self.status()
 
     async def stop(self) -> dict[str, Any]:
+        if self.timeout_task:
+            self.timeout_task.cancel()
+            await asyncio.gather(self.timeout_task, return_exceptions=True)
+            self.timeout_task = None
+        self.addon.interrupt_all()
+        self.connections.reset()
         if self.master:
             self.master.shutdown()
         if self.master_task:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.master_task, timeout=3)
-        self.addon.flush_records()
+        await asyncio.to_thread(self.addon.flush_records)
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -804,12 +1009,20 @@ class ProxyManager:
     def status(self) -> dict[str, Any]:
         local_ip = get_local_ip()
         addresses = get_network_addresses()
+        signature = tuple(sorted((item["name"], item["address"]) for item in addresses))
+        if self._network_signature is not None and signature != self._network_signature:
+            self.connections.reset()
+        self._network_signature = signature
         selected_ip = next(
             (item["address"] for item in addresses if item["name"] == "en0"),
             addresses[0]["address"] if addresses else local_ip,
         )
+        if self.selected_ip and any(item["address"] == self.selected_ip for item in addresses):
+            selected_ip = self.selected_ip
         return {
             "running": self.running,
+            "listenerReady": bool(self.server and self.server.is_serving()),
+            "engineReady": bool(self.master_task and not self.master_task.done()),
             "paused": self.paused,
             "port": self.port,
             "lan": self.lan,
@@ -819,6 +1032,8 @@ class ProxyManager:
             "recordQueueDepth": self.addon.record_queue.qsize(),
             "recordQueueLimit": self.addon.record_queue.maxsize,
             "lastRecordLossReason": self.addon.last_record_loss_reason,
+            "timeoutSettings": dict(self.addon.timeout_settings),
+            "http2TimeoutIsolation": "shared-connection" if self.addon.timeout_settings["http2Enabled"] else "http1-connection",
             "localIp": selected_ip,
             "localIps": addresses,
             "decryptHosts": sorted(self.addon.decrypt_hosts),
@@ -826,6 +1041,7 @@ class ProxyManager:
             "certPort": self.cert_port or None,
             "certDirectUrl": f"http://{selected_ip}:{self.cert_port}/" if self.cert_port else None,
             "lastTlsError": self.addon.last_tls_error,
+            "selectedAddressMissing": bool(self.selected_ip and not any(item["address"] == self.selected_ip for item in addresses)),
         }
 
 

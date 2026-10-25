@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+from .errors import AppError
 from .privacy import Redactor
 from .jobs import check_cancelled
 from .store import Store, new_id, now_ms
@@ -128,33 +129,57 @@ class DomainService:
         scenario_id: str | None = None,
         mode: str = "snapshot",
     ) -> dict[str, Any]:
+        if mode != "snapshot":
+            raise AppError("scope_invalid", "目前只支持固定snapshot范围，请重新选择分析范围")
         filters = dict(filters or {})
         snapshot_at = now_ms()
         filters.pop("cursor", None)
         filters["startedBefore"] = min(int(filters.get("startedBefore") or snapshot_at), snapshot_at)
-        total = self.query(batch_id, {**filters, "limit": 1})["matchCount"]
-        if total > 100_000:
-            raise ValueError("范围超过10万条，请按设备、时间或接口缩小范围；不会将采样冒充全量")
-        rows = self.query_all(batch_id, filters)
+        selection = None
         if selected_ids is not None:
             if not selected_ids:
-                raise ValueError("选择范围为空，请先选择请求")
-            selected = set(selected_ids)
-            rows = [row for row in rows if row["id"] in selected]
-            if selected != {row["id"] for row in rows}:
-                raise ValueError("选择包含已删除、跨批次或不符合筛选条件的请求")
+                raise AppError("scope_selection_missing", "选择范围为空，请先选择请求")
+            selection = set(selected_ids)
         if scenario_id:
-            scenario = self.store.get_scenario(scenario_id)
+            try:
+                scenario = self.store.get_scenario(scenario_id)
+            except ValueError as error:
+                raise AppError("scope_scenario_missing", "原场景已删除，请重新选择场景；未调用模型。") from error
             if scenario["batchId"] != batch_id:
-                raise ValueError("场景不属于当前批次")
-            selected = {item["id"] for item in scenario["requests"]}
-            rows = [row for row in rows if row["id"] in selected]
+                raise AppError("scope_scenario_invalid", "场景不属于当前批次，请调整场景")
+            members = {item["id"] for item in scenario["requests"]}
+            selection = members if selection is None else selection & members
+        if selection is not None:
+            if not selection:
+                raise AppError("scope_empty", "选择或场景范围为空，请先补充样本")
+            if len(selection) > 100_000:
+                raise ValueError("范围超过10万条，请缩小选择或场景")
+            rows = []
+            ids = sorted(selection)
+            for offset in range(0, len(ids), 500):
+                check_cancelled()
+                page = self.query(batch_id, {**filters, "includeIds": ids[offset:offset + 500], "limit": 500})
+                rows.extend(page["items"])
+            if selected_ids is not None and set(selected_ids) != {row["id"] for row in rows}:
+                raise AppError("scope_selection_missing", "选择包含已删除、跨批次、不属于场景或不符合筛选条件的请求，请重新选择；未调用模型。")
+        else:
+            total = self.query(batch_id, {**filters, "limit": 1})["matchCount"]
+            if total > 100_000:
+                raise ValueError("范围超过10万条，请按设备、时间或接口缩小范围；不会将采样冒充全量")
+            rows = self.query_all(batch_id, filters)
+        matched_count = len(rows)
+        unfinished = [row for row in rows if row.get("requestState") == "in_progress"]
+        if unfinished and selected_ids is not None:
+            raise AppError("scope_unfinished", f"所选请求中有{len(unfinished)}条仍在进行中，请等待完成或取消选择后再分析；尚未创建任务，也未调用模型。")
+        # Completed records have stable versions. Never freeze a moving response into
+        # an otherwise immutable Run; publish the omitted coverage explicitly.
+        rows = [row for row in rows if row.get("requestState") != "in_progress"]
         if not rows:
-            raise ValueError("分析范围没有请求，请调整筛选或补充采集")
+            raise AppError("scope_empty", f"分析范围没有已完成请求（{len(unfinished)}条仍在进行中），请等待完成、处理超时或调整筛选；尚未调用模型。")
         with self.store.connect() as db:
             batch_row = db.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
         if batch_row is None:
-            raise ValueError("批次不存在")
+            raise AppError("scope_batch_missing", "原批次已删除，请重新选择范围；未调用模型。")
         batch = self.store._batch_to_dict(batch_row)
         scope = {
             "id": new_id("scope"),
@@ -178,7 +203,9 @@ class DomainService:
             "businessRules": self.store.list_configs("business_rule"),
             "startedAfter": min((row["startedAt"] for row in rows), default=None),
             "startedBefore": max((row["startedAt"] for row in rows), default=None),
-            "unfinishedCount": sum(1 for row in rows if row.get("requestState") == "in_progress"),
+            "unfinishedCount": 0,
+            "matchedCountAtCreation": matched_count,
+            "excludedUnfinishedCount": len(unfinished),
             "expired": False,
         }
         scope["signature"] = self._scope_signature(scope)
@@ -191,12 +218,12 @@ class DomainService:
 
     def validate_scope_payload(self, scope: dict[str, Any]) -> None:
         if not hmac.compare_digest(str(scope.get("signature", "")), self._scope_signature(scope)):
-            raise ValueError("分析范围已被修改，请重新选择范围")
+            raise AppError("scope_invalid", "分析范围已被修改，请重新选择范围")
         if scope.get("expired") or scope.get("configHash") != self.store.config_hash():
-            raise ValueError("范围配置已失效，请重新选择范围")
+            raise AppError("scope_expired", "范围配置已失效，请重新选择范围")
         valid, changed = self.store.request_versions_valid(scope.get("requestVersions") or [])
         if not valid or not scope.get("requestVersions"):
-            raise ValueError(f"范围为空或样本已变化: {changed[:10]}")
+            raise AppError("scope_expired", f"范围为空或样本已变化: {changed[:10]}")
 
     def query_all(self, batch_id: str, filters: dict[str, Any], max_rows: int = 100_000) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -234,6 +261,7 @@ class DomainService:
             sort=str(filters.get("sort", "desc")),
             since_started_at=filters.get("sinceStartedAt"),
             exclude_ids=filters.get("excludeIds"),
+            include_ids=filters.get("includeIds"),
             scope_run_id=filters.get("scopeRunId"),
         )
         self.validate_scope(filters.get("scopeRunId"))
@@ -245,7 +273,7 @@ class DomainService:
         scope = self.store.get_run(run_id)["scope"]
         valid, changed = self.store.request_versions_valid(scope.get("requestVersions") or [])
         if scope.get("expired") or not valid or scope.get("configHash") != self.store.config_hash():
-            raise ValueError(f"分析快照已失效，请创建新范围。变更请求: {changed[:10]}")
+            raise AppError("scope_expired", f"分析快照已失效，请创建新范围。变更请求: {changed[:10]}")
 
     def tree(
         self,
@@ -268,13 +296,34 @@ class DomainService:
             ],
         }
 
-        if parent_type == "group":
+        if parent_type == "hosts":
+            page = self.store.query_requests(batch_id, **self._tree_store_filters(filters), host_summary=True)
+            nodes = []
+            for row in page["items"]:
+                root = self._tree_root(row)
+                nodes.append({"type": "host", "key": root, "root": root, "name": root.split("://", 1)[-1],
+                              "scheme": row["scheme"], "host": row["host"], "port": row["port"],
+                              "count": row["count"], "failureCount": row["failures"], "inProgressCount": row["pending"],
+                              "latestStatus": None, "latestStartedAt": row["latest"]})
+            offset = max(0, int(parent.get("offset") or 0))
+            if parent.get("targetId"):
+                target_root = self._tree_root(self.store.request_summary(parent["targetId"]))
+                index = next((i for i, node in enumerate(nodes) if node["root"] == target_root), None)
+                if index is not None:
+                    offset = index // safe_limit * safe_limit
+            offset = min(offset, max(0, (len(nodes) - 1) // safe_limit * safe_limit))
+            return {"nodes": nodes[offset:offset + safe_limit], "offset": offset,
+                    "nextOffset": offset + safe_limit if offset + safe_limit < len(nodes) else None,
+                    "nodeCount": len(nodes), "coverage": coverage}
+
+        if parent_type in ("group", "host-requests"):
             root = str(parent.get("root") or "")
             method = str(parent.get("method") or "").upper()
             path = str(parent.get("path") or "/")
             parsed_root = urlsplit(root)
             offset = max(0, int(parent.get("offset") or 0))
-            page = self.store.query_requests(batch_id, **(self._tree_store_filters(filters, safe_limit) | {"path_exact": path, "method": method, "host": parsed_root.hostname or "", "scheme": parsed_root.scheme, "port": parsed_root.port or (443 if parsed_root.scheme == "https" else 80), "offset": offset, "seek_id": parent.get("targetId"), "cursor": None}))
+            restrictions = {"path_exact": path, "method": method} if parent_type == "group" else {}
+            page = self.store.query_requests(batch_id, **(self._tree_store_filters(filters, safe_limit) | restrictions | {"host": parsed_root.hostname or "", "scheme": parsed_root.scheme, "port": parsed_root.port or (443 if parsed_root.scheme == "https" else 80), "offset": offset, "seek_id": parent.get("targetId"), "cursor": None}))
             offset = page.get("offset", offset)
             items = page["items"]
             next_offset = offset + len(items) if offset + len(items) < page["matchCount"] else None
@@ -287,7 +336,12 @@ class DomainService:
                 "coverage": coverage,
             }
 
-        grouped_page = self.store.query_requests(batch_id, **self._tree_store_filters(filters), tree_summary=True)
+        subtree_filters = self._tree_store_filters(filters)
+        if parent_type in ("host", "directory"):
+            parsed = urlsplit(str(parent.get("root") or ""))
+            subtree_filters.update(host=parsed.hostname or "", scheme=parsed.scheme,
+                                   port=parsed.port or (443 if parsed.scheme == "https" else 80))
+        grouped_page = self.store.query_requests(batch_id, **subtree_filters, tree_summary=True)
         rows = grouped_page["items"]
         coverage["partial"] = grouped_page["partial"]
         coverage["groupedCount"] = len(rows)
@@ -355,7 +409,10 @@ class DomainService:
     def _tree_root(row: dict[str, Any]) -> str:
         default_port = 443 if row["scheme"] == "https" else 80
         port = "" if int(row["port"]) == default_port else f":{row['port']}"
-        return f"{row['scheme']}://{row['host']}{port}"
+        host = str(row["host"])
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{row['scheme']}://{host}{port}"
 
     def _host_nodes(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -402,7 +459,7 @@ class DomainService:
         prefix: str,
         limit: int,
     ) -> tuple[list[dict[str, Any]], bool]:
-        normalized = "/" + prefix.strip("/") if prefix.strip("/") else ""
+        normalized = prefix if prefix != "/" else ""
         if normalized:
             rows = [
                 row
@@ -410,18 +467,21 @@ class DomainService:
                 if (row["path"].split("?")[0] or "/") == normalized
                 or (row["path"].split("?")[0] or "/").startswith(normalized + "/")
             ]
-        tree: dict[str, Any] = {"children": {}, "rows": []}
+        tree: dict[str, Any] = {"children": {}, "rows": [], "direct": False}
         for row in rows:
             pathname = row["path"].split("?")[0] or "/"
             tree["rows"].append(row)
-            if normalized and pathname == normalized:
+            if pathname == (normalized or "/"):
+                tree["direct"] = True
                 continue
             relative = pathname[len(normalized) :] if normalized else pathname
-            segments = [segment for segment in relative.split("/") if segment]
+            # Empty and trailing segments are meaningful URL characters.
+            segments = (relative[1:] if relative.startswith("/") else relative).split("/")
             node = tree
             for segment in segments:
-                node = node["children"].setdefault(segment, {"children": {}, "rows": []})
+                node = node["children"].setdefault(segment, {"children": {}, "rows": [], "direct": False})
                 node["rows"].append(row)
+            node["direct"] = True
 
         direct_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
@@ -453,7 +513,7 @@ class DomainService:
                     "type": "directory",
                     "key": f"dir:{root}:{path}",
                     "root": root,
-                    "name": "/".join(labels),
+                    "name": "/".join(labels) or "/",
                     "path": path,
                     **self._node_stats(node["rows"]),
                 }
@@ -463,9 +523,7 @@ class DomainService:
 
     @staticmethod
     def _node_direct_groups(node: dict[str, Any]) -> bool:
-        paths = {(row["method"], row["path"].split("?")[0] or "/") for row in node["rows"]}
-        depth = (node["rows"][0]["path"].split("?")[0] or "/").count("/") if node["rows"] else 0
-        return any(path.count("/") == depth for _, path in paths)
+        return bool(node.get("direct"))
 
     @staticmethod
     def _node_stats(items: list[dict[str, Any]]) -> dict[str, Any]:

@@ -1,3 +1,4 @@
+import { Select } from "./Select";
 import {
   Activity,
   AlertTriangle,
@@ -137,9 +138,9 @@ export function ScenarioCompareDialog({
   return (
     <Dialog open={open} title="成功 / 失败场景对比" kicker="SCENARIO PAIRING" wide onClose={onClose}>
       <div className="scenario-compare-controls">
-        <label className="field"><span>场景 A</span><select value={a} onChange={(event) => setA(event.target.value)}>{selectable.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.requestCount} 条</option>)}</select></label>
+        <label className="field"><span>场景 A</span><Select value={a} onChange={(event) => setA(event.target.value)}>{selectable.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.requestCount} 条</option>)}</Select></label>
         <GitCompareArrows size={18} />
-        <label className="field"><span>场景 B</span><select value={b} onChange={(event) => setB(event.target.value)}>{selectable.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.requestCount} 条</option>)}</select></label>
+        <label className="field"><span>场景 B</span><Select value={b} onChange={(event) => setB(event.target.value)}>{selectable.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.requestCount} 条</option>)}</Select></label>
         <button className="button primary compact self-end" disabled={!a || !b || a === b || busy} onClick={() => void onCompare(a, b)}>
           {busy ? <LoaderCircle className="spin" size={14} /> : <GitCompareArrows size={14} />} 开始配对
         </button>
@@ -205,12 +206,12 @@ export function AggregateDialog({
   return (
     <Dialog open={open} title="接口聚合与耗时" kicker="FAILURE RATE · P50 · P95" wide onClose={onClose}>
       <div className="aggregate-controls">
-        <label className="field"><span>聚合维度</span><select value={groupBy} onChange={(event) => onGroupBy(event.target.value)}>
+        <label className="field"><span>聚合维度</span><Select value={groupBy} onChange={(event) => onGroupBy(event.target.value)}>
           <option value="endpoint">接口</option>
           <option value="status">HTTP 状态</option>
           <option value="business">业务状态</option>
           <option value="device">设备</option>
-        </select></label>
+        </Select></label>
         <button className="button primary compact" disabled={busy} onClick={() => void onLoad()}>
           {busy ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />} 重新聚合
         </button>

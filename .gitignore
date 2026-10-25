@@ -26,3 +26,10 @@ __pycache__
 *.app/
 *.dmg
 AI-Proxy-*.zip
+
+# Local provider credentials never belong in the repository.
+auth.json
+credentials/
+
+# Locally prepared, versioned distribution artifacts.
+/release/
